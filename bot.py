@@ -103,6 +103,10 @@ def send_message(text: str):
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=15,
         )
+        if not r.ok:
+            log.error("Telegram error %s: %s", r.status_code, r.text)
+        else:
+            log.info("Telegram OK (chat_id=%s)", TELEGRAM_CHAT_ID)
         r.raise_for_status()
     except Exception as e:
         log.error("Telegram error: %s", e)
