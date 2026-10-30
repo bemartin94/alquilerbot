@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -113,10 +114,13 @@ def send_message(text: str):
 
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
-def fetch(url: str, referer: str) -> BeautifulSoup | None:
-    session = requests.Session()
-    session.headers.update({**BASE_HEADERS, "Referer": referer})
+def fetch(url: str, referer: str, use_cloudscraper: bool = False) -> BeautifulSoup | None:
     try:
+        if use_cloudscraper:
+            session = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows"})
+        else:
+            session = requests.Session()
+        session.headers.update({**BASE_HEADERS, "Referer": referer})
         resp = session.get(url, timeout=30)
         resp.raise_for_status()
         resp.encoding = "utf-8"
@@ -203,7 +207,7 @@ def scrape_mercadolibre(source: dict) -> list[dict]:
 
 # ── ArgenProp scraper ─────────────────────────────────────────────────────────
 def scrape_argenprop(source: dict) -> list[dict]:
-    soup = fetch(source["url"], source["referer"])
+    soup = fetch(source["url"], source["referer"], use_cloudscraper=True)
     if not soup:
         return []
 
