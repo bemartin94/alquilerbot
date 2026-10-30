@@ -342,9 +342,6 @@ def check(send_summary: bool = False):
     save_seen(seen)
     log.info("Cycle done — %d new total", total_new)
 
-    if send_summary and any("⚠️" in l for l in lines):
-        summary = "📊 <b>Resumen del chequeo</b>\n" + "\n".join(lines)
-        send_message(summary)
 
 
 def main():
