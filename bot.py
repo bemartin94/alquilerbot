@@ -314,10 +314,9 @@ SCRAPERS = {
 }
 
 
-def check(send_summary: bool = False):
+def check():
     seen = load_seen()
     total_new = 0
-    lines = []
 
     for source in load_sources():
         scraper_fn = SCRAPERS[source["scraper"]]
@@ -325,12 +324,10 @@ def check(send_summary: bool = False):
 
         if not listings:
             log.warning("[%s] No listings — possible block or page change", source["name"])
-            lines.append(f"⚠️ {source['name']}: 0 resultados (posible bloqueo)")
             continue
 
         new = [l for l in listings if l["id"] not in seen]
         log.info("[%s] %d new listing(s)", source["name"], len(new))
-        lines.append(f"{'✅' if new else '➖'} {source['name']}: {len(listings)} encontrados, {len(new)} nuevos")
 
         for l in new:
             send_message(format_listing(l, source))
@@ -362,8 +359,7 @@ def main():
         return
 
     if once:
-        # Modo GitHub Actions: corre una vez y termina
-        check(send_summary=True)
+        check()
         return
 
     sources = load_sources()

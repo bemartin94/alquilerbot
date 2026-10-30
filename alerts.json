@@ -6,11 +6,7 @@
       "https://www.zonaprop.com.ar/departamentos-alquiler-villa-urquiza-villa-pueyrredon-villa-ortuzar-parque-chas-coghlan-belgrano-r-belgrano-florida-con-patio-desde-1-hasta-4-ambientes-mas-30-m2-cubiertos-5000-670000-pesos-orden-publicado-descendente.html",
       "https://www.zonaprop.com.ar/casas-ph-alquiler-saavedra-coghlan-villa-crespo-villa-urquiza-parque-chas-villa-del-parque-chacarita-nunez-villa-pueyrredon-villa-ortuzar-agronomia-la-paternal-villa-devoto-florida-villa-martelli-mas-de-3-ambientes-mas-90-m2-cubiertos-5000-1800000-pesos-orden-publicado-descendente.html"
     ],
-    "argenprop_urls": [
-      "https://www.argenprop.com/casas-o-departamentos-o-ph/alquiler/agronomia-o-belgrano-r-o-chacarita-o-coghlan-o-nunez-o-parque-chas-o-paternal-o-saavedra-o-villa-crespo-o-villa-ortuzar-o-villa-pueyrredon-o-villa-urquiza/pesos-hasta-680000",
-      "https://www.argenprop.com/ph/alquiler/agronomia-o-belgrano-r-o-chacarita-o-coghlan-o-colegiales-o-nunez-o-palermo-soho-o-parque-centenario-o-parque-chas-o-paternal-o-saavedra-o-villa-crespo-o-villa-devoto-o-villa-ortuzar-o-villa-pueyrredon-o-villa-urquiza/pesos-hasta-800000?desde-32-m2-cubiertos",
-      "https://www.argenprop.com/departamentos/alquiler/agronomia-o-belgrano-r-o-chacarita-o-coghlan-o-colegiales-o-nunez-o-palermo-soho-o-parque-centenario-o-parque-chas-o-paternal-o-saavedra-o-villa-crespo-o-villa-devoto-o-villa-ortuzar-o-villa-pueyrredon-o-villa-urquiza/pesos-hasta-650000?desde-32-m2-cubiertos"
-    ],
+    "argenprop_urls": [],
     "mercadolibre_urls": [
       "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/capital-federal/nunez-o-agronomia-o-belgrano-r-o-chacarita-o-coghlan-o-colegiales-o-paternal-o-saavedra-o-villa-pueyrredon-o-villa-crespo-o-villa-ortuzar-o-villa-urquiza-o-parque-centenario-o-parque-chas/_PriceRange_0ARS-650000ARS_NoIndex_True_TOTAL*AREA_32m%C2%B2-*",
       "https://inmuebles.mercadolibre.com.ar/ph/alquiler/capital-federal/nunez-o-agronomia-o-belgrano-r-o-chacarita-o-coghlan-o-colegiales-o-paternal-o-saavedra-o-villa-pueyrredon-o-villa-crespo-o-villa-ortuzar-o-villa-urquiza-o-parque-centenario-o-parque-chas/_PriceRange_0ARS-800000ARS_NoIndex_True_TOTAL*AREA_32m%C2%B2-*"
@@ -19,7 +15,6 @@
   {
     "name": "Florida GBA · hasta $700k",
     "zonaprop_urls": [],
-    "argenprop_urls": [],
     "mercadolibre_urls": [
       "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/bsas-gba-norte/vicente-lopez/florida/_PriceRange_0ARS-650000ARS_NoIndex_True_TOTAL*AREA_32m%C2%B2-*",
       "https://inmuebles.mercadolibre.com.ar/ph/alquiler/bsas-gba-norte/vicente-lopez/florida/_PriceRange_0ARS-700000ARS_NoIndex_True_TOTAL*AREA_32m%C2%B2-*"
