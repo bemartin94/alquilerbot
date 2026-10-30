@@ -287,9 +287,10 @@ SCRAPERS = {
 }
 
 
-def check():
+def check(send_summary: bool = False):
     seen = load_seen()
     total_new = 0
+    lines = []
 
     for source in load_sources():
         scraper_fn = SCRAPERS[source["scraper"]]
@@ -297,20 +298,26 @@ def check():
 
         if not listings:
             log.warning("[%s] No listings — possible block or page change", source["name"])
+            lines.append(f"⚠️ {source['name']}: 0 resultados (posible bloqueo)")
             continue
 
         new = [l for l in listings if l["id"] not in seen]
         log.info("[%s] %d new listing(s)", source["name"], len(new))
+        lines.append(f"{'✅' if new else '➖'} {source['name']}: {len(listings)} encontrados, {len(new)} nuevos")
 
         for l in new:
             send_message(format_listing(l, source))
             seen.add(l["id"])
-            time.sleep(0.4)   # Telegram rate limit: ~30 msg/s
+            time.sleep(0.4)
 
         total_new += len(new)
 
     save_seen(seen)
     log.info("Cycle done — %d new total", total_new)
+
+    if send_summary:
+        summary = "📊 <b>Resumen del chequeo</b>\n" + "\n".join(lines)
+        send_message(summary)
 
 
 def main():
@@ -332,7 +339,7 @@ def main():
 
     if once:
         # Modo GitHub Actions: corre una vez y termina
-        check()
+        check(send_summary=True)
         return
 
     sources = load_sources()
