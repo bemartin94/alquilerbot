@@ -35,21 +35,29 @@ def load_sources() -> list[dict]:
     sources = []
     for alert in alerts:
         label = alert.get("name", "Alerta")
-        if zp := alert.get("zonaprop_url"):
+        for zp_url in alert.get("zonaprop_urls", []):
             sources.append({
                 "name": f"ZonaProp · {label}",
                 "emoji": "🟠",
-                "url": zp,
+                "url": zp_url,
                 "scraper": "zonaprop",
                 "referer": "https://www.zonaprop.com.ar/",
             })
-        if ap := alert.get("argenprop_url"):
+        for ap_url in alert.get("argenprop_urls", []):
             sources.append({
                 "name": f"ArgenProp · {label}",
                 "emoji": "🔵",
-                "url": ap,
+                "url": ap_url,
                 "scraper": "argenprop",
                 "referer": "https://www.argenprop.com/",
+            })
+        for ml_url in alert.get("mercadolibre_urls", []):
+            sources.append({
+                "name": f"MercadoLibre · {label}",
+                "emoji": "🟡",
+                "url": ml_url.split("#")[0],  # los fragmentos (#...) son solo client-side
+                "scraper": "mercadolibre",
+                "referer": "https://inmuebles.mercadolibre.com.ar/",
             })
     return sources
 
@@ -144,6 +152,51 @@ def scrape_zonaprop(source: dict) -> list[dict]:
     return results
 
 
+# ── MercadoLibre scraper ──────────────────────────────────────────────────────
+def scrape_mercadolibre(source: dict) -> list[dict]:
+    soup = fetch(source["url"], source["referer"])
+    if not soup:
+        return []
+
+    results = []
+    for item in soup.select("li.ui-search-layout__item"):
+        link_el = (
+            item.select_one("a.poly-component__title")
+            or item.select_one("a.ui-search-link")
+        )
+        if not link_el:
+            continue
+
+        href = link_el.get("href", "").split("?")[0].split("#")[0]
+        m = re.search(r"MLA-?(\d+)", href)
+        if not m:
+            continue
+        listing_id = m.group(1)
+
+        title    = _clean(link_el.get_text(" ", strip=True))
+        loc_el   = item.select_one("span.poly-component__location")
+        address  = _clean(loc_el.get_text(strip=True)) if loc_el else title
+
+        cur_el   = item.select_one("span.andes-money-amount__currency-symbol")
+        frac_el  = item.select_one("span.andes-money-amount__fraction")
+        if frac_el:
+            cur   = _clean(cur_el.get_text(strip=True)) if cur_el else "$"
+            price = f"{cur} {_clean(frac_el.get_text(strip=True))}"
+        else:
+            price = ""
+
+        features = " · ".join(
+            _clean(a.get_text(strip=True))
+            for a in item.select("li.poly-attributes-list__item")
+            if a.get_text(strip=True)
+        )
+
+        results.append(_listing(f"ml_{listing_id}", address, price, "", features, href))
+
+    log.info("[MercadoLibre] %d listings scraped", len(results))
+    return results
+
+
 # ── ArgenProp scraper ─────────────────────────────────────────────────────────
 def scrape_argenprop(source: dict) -> list[dict]:
     soup = fetch(source["url"], source["referer"])
@@ -228,8 +281,9 @@ def format_listing(listing: dict, source: dict) -> str:
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 SCRAPERS = {
-    "zonaprop":  scrape_zonaprop,
-    "argenprop": scrape_argenprop,
+    "zonaprop":      scrape_zonaprop,
+    "argenprop":     scrape_argenprop,
+    "mercadolibre":  scrape_mercadolibre,
 }
 
 
