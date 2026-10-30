@@ -18,6 +18,7 @@ from pathlib import Path
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -206,8 +207,26 @@ def scrape_mercadolibre(source: dict) -> list[dict]:
 
 
 # ── ArgenProp scraper ─────────────────────────────────────────────────────────
+def _fetch_with_browser(url: str) -> BeautifulSoup | None:
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx  = browser.new_context(
+                user_agent=BASE_HEADERS["User-Agent"],
+                locale="es-AR",
+            )
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            content = page.content()
+            browser.close()
+        return BeautifulSoup(content, "lxml")
+    except Exception as e:
+        log.error("Browser fetch error (%s): %s", url, e)
+        return None
+
+
 def scrape_argenprop(source: dict) -> list[dict]:
-    soup = fetch(source["url"], source["referer"], use_cloudscraper=True)
+    soup = _fetch_with_browser(source["url"])
     if not soup:
         return []
 
