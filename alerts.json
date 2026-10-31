@@ -1,6 +1,7 @@
 [
   {
     "name": "Norte CABA · hasta $670k",
+    "max_total_price": 800000,
     "zonaprop_urls": [
       "https://www.zonaprop.com.ar/casas-ph-alquiler-vicente-lopez-saavedra-coghlan-villa-crespo-villa-urquiza-parque-chas-palermo-chacarita-nunez-villa-pueyrredon-villa-ortuzar-agronomia-la-paternal-colegiales-caballito-norte-caballito-desde-1-hasta-4-ambientes-mas-32-m2-cubiertos-5000-800000-pesos-orden-publicado-descendente.html",
       "https://www.zonaprop.com.ar/departamentos-alquiler-villa-urquiza-villa-pueyrredon-villa-ortuzar-parque-chas-coghlan-belgrano-r-belgrano-florida-con-patio-desde-1-hasta-4-ambientes-mas-30-m2-cubiertos-5000-670000-pesos-orden-publicado-descendente.html",
@@ -14,6 +15,7 @@
   },
   {
     "name": "Florida GBA · hasta $700k",
+    "max_total_price": 800000,
     "zonaprop_urls": [],
     "mercadolibre_urls": [
       "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/bsas-gba-norte/vicente-lopez/florida/_PriceRange_0ARS-650000ARS_NoIndex_True_TOTAL*AREA_32m%C2%B2-*",

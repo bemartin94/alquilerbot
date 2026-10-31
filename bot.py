@@ -36,7 +36,8 @@ def load_sources() -> list[dict]:
     alerts = json.loads(ALERTS_FILE.read_text(encoding="utf-8"))
     sources = []
     for alert in alerts:
-        label = alert.get("name", "Alerta")
+        label     = alert.get("name", "Alerta")
+        max_total = alert.get("max_total_price", 0)
         for zp_url in alert.get("zonaprop_urls", []):
             sources.append({
                 "name": f"ZonaProp · {label}",
@@ -44,6 +45,7 @@ def load_sources() -> list[dict]:
                 "url": zp_url,
                 "scraper": "zonaprop",
                 "referer": "https://www.zonaprop.com.ar/",
+                "max_total_price": max_total,
             })
         for ap_url in alert.get("argenprop_urls", []):
             sources.append({
@@ -52,14 +54,16 @@ def load_sources() -> list[dict]:
                 "url": ap_url,
                 "scraper": "argenprop",
                 "referer": "https://www.argenprop.com/",
+                "max_total_price": max_total,
             })
         for ml_url in alert.get("mercadolibre_urls", []):
             sources.append({
                 "name": f"MercadoLibre · {label}",
                 "emoji": "🟡",
-                "url": ml_url.split("#")[0],  # los fragmentos (#...) son solo client-side
+                "url": ml_url.split("#")[0],
                 "scraper": "mercadolibre",
                 "referer": "https://inmuebles.mercadolibre.com.ar/",
+                "max_total_price": max_total,
             })
     return sources
 
@@ -196,7 +200,7 @@ def scrape_mercadolibre(source: dict) -> list[dict]:
 
         features = " · ".join(
             _clean(a.get_text(strip=True))
-            for a in item.select("li.poly-attributes-list__item")
+            for a in item.select("li.poly-attributes_list__item")
             if a.get_text(strip=True)
         )
 
@@ -273,8 +277,13 @@ def scrape_argenprop(source: dict) -> list[dict]:
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 def _clean(text: str) -> str:
-    """Decode HTML entities and collapse whitespace."""
     return re.sub(r"\s+", " ", html_mod.unescape(text)).strip()
+
+
+def _parse_price(text: str) -> int:
+    """'$ 650.000' or '650,000 pesos' → 650000. Returns 0 if unparseable."""
+    digits = re.sub(r"[^\d]", "", text)
+    return int(digits) if digits else 0
 
 
 def _text(el, selector: str, sep: str = " ") -> str:
@@ -296,10 +305,10 @@ def _listing(uid, address, price, expenses, features, link) -> dict:
 def format_listing(listing: dict, source: dict) -> str:
     price_line = listing["price"]
     if listing["expenses"]:
-        price_line += f"  +  {listing['expenses']}"
+        price_line += f" + {listing['expenses']} expensas"
 
     return (
-        f"{source['emoji']} <b>{source['name']}</b> — <b>{listing['address']}</b>\n"
+        f"<b>{listing['address']}</b>\n"
         f"💰 {price_line}\n"
         f"📐 {listing['features']}\n"
         f'🔗 <a href="{listing["link"]}">Ver publicación</a>'
@@ -325,6 +334,13 @@ def check():
         if not listings:
             log.warning("[%s] No listings — possible block or page change", source["name"])
             continue
+
+        max_total = source.get("max_total_price", 0)
+        if max_total:
+            listings = [
+                l for l in listings
+                if _parse_price(l["price"]) + _parse_price(l["expenses"]) <= max_total
+            ]
 
         new = [l for l in listings if l["id"] not in seen]
         log.info("[%s] %d new listing(s)", source["name"], len(new))
