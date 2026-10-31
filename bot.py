@@ -280,6 +280,17 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", html_mod.unescape(text)).strip()
 
 
+_ELECTRIC_KEYWORDS = re.compile(
+    r"\b(sin\s+gas|todo\s+el[eé]ctric[oa]|calefacci[oó]n\s+el[eé]ctric[oa]|"
+    r"cocina\s+el[eé]ctric[oa]|no\s+tiene\s+gas|sin\s+gasoducto)\b",
+    re.IGNORECASE,
+)
+
+def _is_electric_only(listing: dict) -> bool:
+    text = " ".join([listing.get("address", ""), listing.get("features", "")])
+    return bool(_ELECTRIC_KEYWORDS.search(text))
+
+
 def _parse_price(text: str) -> int:
     """'$ 650.000' or '650,000 pesos' → 650000. Returns 0 if unparseable."""
     digits = re.sub(r"[^\d]", "", text)
@@ -341,6 +352,8 @@ def check():
                 l for l in listings
                 if _parse_price(l["price"]) + _parse_price(l["expenses"]) <= max_total
             ]
+
+        listings = [l for l in listings if not _is_electric_only(l)]
 
         new = [l for l in listings if l["id"] not in seen]
         log.info("[%s] %d new listing(s)", source["name"], len(new))
