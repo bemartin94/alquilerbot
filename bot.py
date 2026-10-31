@@ -147,7 +147,9 @@ def scrape_zonaprop(source: dict) -> list[dict]:
         if not listing_id:
             continue
 
-        address  = _text(card, "[class*='location-address']")
+        street   = _text(card, "[class*='location-address']")
+        hood     = _text(card, "[class*='location-text']").split(",")[0].strip()
+        address  = f"{street}, {hood}" if hood else street
         price    = _text(card, "h2[class*='postingPrices-module__price']")
         expenses = _text(card, "[class*='expenses']")
         features = _text(card, "[class*='posting-main-features-block']", sep=" · ")
@@ -186,9 +188,12 @@ def scrape_mercadolibre(source: dict) -> list[dict]:
             continue
         listing_id = m.group(1)
 
-        title    = _clean(link_el.get_text(" ", strip=True))
-        loc_el   = item.select_one("span.poly-component__location")
-        address  = _clean(loc_el.get_text(strip=True)) if loc_el else title
+        title   = _clean(link_el.get_text(" ", strip=True))
+        loc_el  = item.select_one("span.poly-component__location")
+        loc_raw = _clean(loc_el.get_text(strip=True)) if loc_el else title
+        # "Blanco Encalada 3400, Belgrano R, Capital Federal" → drop last part
+        loc_parts = [p.strip() for p in loc_raw.split(",")]
+        address = ", ".join(loc_parts[:-1]) if len(loc_parts) > 2 else loc_raw
 
         cur_el   = item.select_one("span.andes-money-amount__currency-symbol")
         frac_el  = item.select_one("span.andes-money-amount__fraction")
