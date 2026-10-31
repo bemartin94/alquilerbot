@@ -2,7 +2,7 @@ name: Apartment Bot
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # cada 10 minutos
+    - cron: '*/12 * * * *'   # cada 12 minutos
   workflow_dispatch:          # también se puede disparar manualmente
 
 jobs:

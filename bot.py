@@ -325,9 +325,9 @@ def format_listing(listing: dict, source: dict) -> str:
 
     return (
         f"<b>{listing['address']}</b>\n"
-        f"💰 {price_line}\n"
-        f"📐 {listing['features']}\n"
-        f'🔗 <a href="{listing["link"]}">Ver publicación</a>'
+        f"{price_line}\n"
+        f"{listing['features']}\n"
+        f'<a href="{listing["link"]}">Ver publicación</a>'
     )
 
 
