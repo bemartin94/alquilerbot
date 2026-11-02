@@ -219,6 +219,22 @@ def scrape_mercadolibre(source: dict) -> list[dict]:
     return results
 
 
+def _fetch_ml_expenses(listing_url: str) -> str:
+    """Fetch expenses from ML listing detail page. Returns empty string if not found."""
+    soup = fetch(listing_url, "https://inmuebles.mercadolibre.com.ar/")
+    if not soup:
+        return ""
+    # Look for "Expensas" row in specs table
+    for row in soup.select("tr"):
+        header = row.select_one("th")
+        value  = row.select_one("td")
+        if header and value and "expensa" in header.get_text(strip=True).lower():
+            val = _clean(value.get_text(strip=True))
+            if val and val != "0 ARS" and val != "0":
+                return val
+    return ""
+
+
 # ── ArgenProp scraper ─────────────────────────────────────────────────────────
 def _fetch_with_browser(url: str) -> BeautifulSoup | None:
     try:
@@ -373,6 +389,8 @@ def check():
         log.info("[%s] %d new listing(s)", source["name"], len(new))
 
         for l in new:
+            if source["scraper"] == "mercadolibre" and not l["expenses"]:
+                l["expenses"] = _fetch_ml_expenses(l["link"])
             send_message(format_listing(l, source))
             seen.add(l["id"])
             time.sleep(0.4)
