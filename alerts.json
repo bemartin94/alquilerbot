@@ -1,6 +1,7 @@
 [
   {
     "name": "Norte CABA · hasta $670k",
+    "min_price": 200000,
     "max_total_price": 800000,
     "zonaprop_urls": [
       "https://www.zonaprop.com.ar/casas-ph-alquiler-vicente-lopez-saavedra-coghlan-villa-crespo-villa-urquiza-parque-chas-palermo-chacarita-nunez-villa-pueyrredon-villa-ortuzar-agronomia-la-paternal-colegiales-caballito-norte-caballito-desde-1-hasta-4-ambientes-mas-32-m2-cubiertos-5000-800000-pesos-orden-publicado-descendente.html",
@@ -15,6 +16,7 @@
   },
   {
     "name": "Florida GBA · hasta $700k",
+    "min_price": 200000,
     "max_total_price": 800000,
     "zonaprop_urls": [],
     "mercadolibre_urls": [

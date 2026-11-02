@@ -37,6 +37,7 @@ def load_sources() -> list[dict]:
     sources = []
     for alert in alerts:
         label     = alert.get("name", "Alerta")
+        min_price = alert.get("min_price", 0)
         max_total = alert.get("max_total_price", 0)
         for zp_url in alert.get("zonaprop_urls", []):
             sources.append({
@@ -45,6 +46,7 @@ def load_sources() -> list[dict]:
                 "url": zp_url,
                 "scraper": "zonaprop",
                 "referer": "https://www.zonaprop.com.ar/",
+                "min_price": min_price,
                 "max_total_price": max_total,
             })
         for ap_url in alert.get("argenprop_urls", []):
@@ -54,6 +56,7 @@ def load_sources() -> list[dict]:
                 "url": ap_url,
                 "scraper": "argenprop",
                 "referer": "https://www.argenprop.com/",
+                "min_price": min_price,
                 "max_total_price": max_total,
             })
         for ml_url in alert.get("mercadolibre_urls", []):
@@ -63,6 +66,7 @@ def load_sources() -> list[dict]:
                 "url": ml_url.split("#")[0],
                 "scraper": "mercadolibre",
                 "referer": "https://inmuebles.mercadolibre.com.ar/",
+                "min_price": min_price,
                 "max_total_price": max_total,
             })
     return sources
@@ -319,9 +323,13 @@ def _listing(uid, address, price, expenses, features, link) -> dict:
 
 
 def format_listing(listing: dict, source: dict) -> str:
+    rent     = _parse_price(listing["price"])
+    expenses = _parse_price(listing["expenses"])
+    total    = rent + expenses
+
     price_line = listing["price"]
     if listing["expenses"]:
-        price_line += f" + {listing['expenses']} expensas"
+        price_line += f" + {listing['expenses']} expensas = ${total:,.0f} total".replace(",", ".")
 
     return (
         f"<b>{listing['address']}</b>\n"
@@ -351,12 +359,13 @@ def check():
             log.warning("[%s] No listings — possible block or page change", source["name"])
             continue
 
+        min_price = source.get("min_price", 0)
         max_total = source.get("max_total_price", 0)
-        if max_total:
-            listings = [
-                l for l in listings
-                if _parse_price(l["price"]) + _parse_price(l["expenses"]) <= max_total
-            ]
+        listings = [
+            l for l in listings
+            if (not min_price or _parse_price(l["price"]) >= min_price)
+            and (not max_total or _parse_price(l["price"]) + _parse_price(l["expenses"]) <= max_total)
+        ]
 
         listings = [l for l in listings if not _is_electric_only(l)]
 
