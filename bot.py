@@ -346,6 +346,8 @@ def format_listing(listing: dict, source: dict) -> str:
     price_line = listing["price"]
     if listing["expenses"]:
         price_line += f" + {listing['expenses']} expensas = ${total:,.0f} total".replace(",", ".")
+    else:
+        price_line += " (sin expensas)"
 
     return (
         f"<b>{listing['address']}</b>\n"
