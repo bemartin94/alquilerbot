@@ -751,9 +751,11 @@ Casos:
 2. "hasta 800k de alquiler" / solo alquiler / sin aclaración:
    → max_rent_price = 800000, max_total_price = 0
 
-3. No especifica: tratalo como caso 2.
+3. No especifica precio: NO inventes uno. max_rent_price = 0, max_total_price = 0 y no
+   pongas rango de precio en las URLs (ZonaProp sin el tramo "-{min}-{max}-pesos",
+   MercadoLibre sin "_PriceRange_...", ArgenProp sin "--precio-desde-...").
 
-- Las URLs SIEMPRE usan max_rent_price en el rango de precio
+- Las URLs usan max_rent_price en el rango de precio (si es 0, sin rango de precio)
 - min_price es SIEMPRE 200000
 - Si el usuario no especifica tipo, usá departamentos, ph y casas
 - Si no especifica m2 mínimo, usá 30. Los m² son siempre TOTALES (en el summary escribí "m² totales")
@@ -1410,18 +1412,17 @@ async def cmd_estado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Step-by-step wizard ────────────────────────────────────────────────────────
 
+def _tipo_keyboard(prefix: str = "tipo_") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏢 Depto",       callback_data=f"{prefix}depto"),
+        InlineKeyboardButton("🏠 Casa o PH",   callback_data=f"{prefix}casaph"),
+        InlineKeyboardButton("✅ Cualquiera",  callback_data=f"{prefix}todos"),
+    ]])
+
 async def _start_wizard(msg, ctx: ContextTypes.DEFAULT_TYPE):
     """Begin the wizard: ask for property type. `msg` is a Message object."""
     ctx.user_data.pop("wizard", None)
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🏢 Depto",       callback_data="tipo_depto"),
-        InlineKeyboardButton("🏠 Casa o PH",   callback_data="tipo_casaph"),
-        InlineKeyboardButton("✅ Cualquiera",  callback_data="tipo_todos"),
-    ]])
-    await msg.reply_text(
-        "¿Qué tipo de propiedad buscás?",
-        reply_markup=kb,
-    )
+    await msg.reply_text("¿Qué tipo de propiedad buscás?", reply_markup=_tipo_keyboard())
     return AWAITING_TIPO
 
 async def handle_wizard_tipo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1441,15 +1442,30 @@ async def handle_wizard_tipo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "tipo_casaph": "🏠 Casa o PH",
         "tipo_todos": "✅ Cualquier tipo",
     }
-    tipo = tipo_map.get(query.data, "departamento, PH o casa")
+    key  = "tipo_" + query.data.split("_", 1)[1]   # tipo_x o maptipo_x
+    tipo = tipo_map.get(key, "departamento, PH o casa")
     ctx.user_data.setdefault("wizard", {})["tipo"] = tipo
-    await query.edit_message_text(label_map.get(query.data, "✅ Cualquier tipo"))
+    await query.edit_message_text(label_map.get(key, "✅ Cualquier tipo"))
     await query.message.reply_text(
         "¿Cuántos ambientes buscás?\n"
         "Ej: <b>2</b>, <b>2 a 3</b>, <b>3+</b>, <b>monoambiente</b>",
         parse_mode="HTML",
     )
     return AWAITING_AMBIENTES
+
+async def handle_map_tipo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tipo elegido después de seleccionar barrios en el mapa (/submit-zones)."""
+    chat_id = str(update.callback_query.message.chat_id)
+    users   = load_users()
+    user    = users.get(chat_id, {})
+    if user.get("_wizard_step") != "tipo":   # botón viejo
+        await update.callback_query.answer()
+        return ConversationHandler.END
+    user.pop("_wizard_step", None)
+    save_users(users)
+    ctx.user_data.pop("wizard", None)
+    ctx.user_data["barrios_mapa"] = user.get("zones", [])
+    return await handle_wizard_tipo(update, ctx)
 
 async def handle_wizard_ambientes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.setdefault("wizard", {})["ambientes"] = update.message.text.strip()
@@ -1521,6 +1537,7 @@ async def handle_wizard_extras(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if zones:
         desc = f"Zonas preferidas del usuario: {', '.join(zones)}. " + desc
 
+    ctx.user_data["last_desc"] = desc
     await update.message.reply_text("Un segundo, estoy armando tu búsqueda...")
     result = await interpret_search(desc)
     if not result:
@@ -1546,7 +1563,7 @@ async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, res
     elif rent_cap:
         price_note = f"💰 Precio: hasta {fmt(rent_cap)} de alquiler, sin contar expensas"
     else:
-        price_note = ""
+        price_note = "💰 Precio: sin tope (no indicaste un máximo)"
     msg = f"Esto es lo que entendí:\n\n<b>{result['summary']}</b>\n\n"
     if price_note:
         msg += f"{price_note}\n\n"
@@ -1562,7 +1579,7 @@ class _MapWizardPending(filters.MessageFilter):
     allow_reentry=True, so entry points are checked BEFORE the current state's
     handlers: a catch-all text entry point would swallow every wizard answer."""
     def filter(self, message) -> bool:
-        return load_users().get(str(message.chat_id), {}).get("_wizard_step") == "ambientes"
+        return load_users().get(str(message.chat_id), {}).get("_wizard_step") in ("ambientes", "tipo")
 
 MAP_WIZARD_PENDING = _MapWizardPending()
 
@@ -1571,6 +1588,9 @@ async def receive_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     step; otherwise the message is rejected with the command list."""
     chat_id = str(update.effective_chat.id)
     step = load_users().get(chat_id, {}).get("_wizard_step")
+    if step == "tipo":
+        await update.message.reply_text("Elegí el tipo de propiedad con los botones de arriba 👆")
+        return None
     if step == "ambientes":
         # Clear the flag (PTB takes over from here)
         users = load_users()
@@ -1593,6 +1613,22 @@ async def receive_description_in_flow(update: Update, ctx: ContextTypes.DEFAULT_
 async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     desc         = update.message.text.strip()
     chat_id      = str(update.effective_chat.id)
+    previous     = ctx.user_data.pop("correcting", None) and ctx.user_data.get("last_desc")
+    if previous:
+        # Corrección de la búsqueda anterior: se mantiene todo lo demás.
+        ctx.user_data["last_desc"] = (
+            f"{previous}\nCorrección del usuario (aplicala y mantené todo lo demás igual, "
+            f"incluido el precio si no lo cambia): {desc}"
+        )
+        await update.message.reply_text("Un segundo, estoy aplicando el cambio...")
+        result = await interpret_search(ctx.user_data["last_desc"])
+        if result and not result.get("no_es_busqueda"):
+            wiz = ctx.user_data.get("wizard", {})
+            if "expensas_incluidas" in wiz and not re.search(r"\d", desc):
+                result["_expensas_incluidas"] = wiz["expensas_incluidas"]
+            return await _show_confirmation(update, ctx, result)
+        await update.message.reply_text("No pude aplicar el cambio. Contame de nuevo qué estás buscando.")
+        return AWAITING_DESCRIPTION
     if len(desc) < 5:
         await update.message.reply_text(
             "La descripción es muy corta. Contame qué estás buscando, ej: <i>2 ambientes en Palermo, hasta 800k total</i>",
@@ -1606,6 +1642,7 @@ async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAUL
             ctx.user_data["barrios_mapa"] = barrios_mapa
     if barrios_mapa:
         desc = f"Zonas preferidas del usuario (usá estas si no menciona otras): {', '.join(barrios_mapa)}. Descripción: {desc}"
+    ctx.user_data["last_desc"] = desc
     await update.message.reply_text("Un segundo, estoy interpretando tu búsqueda...")
     result = await interpret_search(desc)
     if result and result.get("no_es_busqueda"):
@@ -1655,7 +1692,15 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AWAITING_INITIAL_SEND
 
     if text in ("no", "n"):
-        await update.message.reply_text("Contame de nuevo qué estás buscando. Podés ser más específico.")
+        if ctx.user_data.get("last_desc"):
+            ctx.user_data["correcting"] = True
+            await update.message.reply_text(
+                "¿Qué querés cambiar? Lo demás queda igual.\n"
+                "Ej: <i>que sea casa o PH</i>, <i>hasta 1M</i>, <i>agregá Saavedra</i>",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text("Contame de nuevo qué estás buscando. Podés ser más específico.")
         return AWAITING_DESCRIPTION
 
     await update.message.reply_text("Respondé <b>si</b> o <b>no</b>.", parse_mode="HTML")
@@ -1833,21 +1878,18 @@ async def _http_submit_zones(request):
     save_users(users)
 
     lista = ", ".join(barrios)
-    users[chat_id_str]["_wizard_step"] = "ambientes"
+    users[chat_id_str]["_wizard_step"] = "tipo"
     save_users(users)
     if _BOT_APP:
         await _BOT_APP.bot.send_message(
             chat_id=chat_id,
-            text=f"Perfecto, <b>{lista}</b>.",
+            text=f"Perfecto, <b>{html_mod.escape(lista)}</b>.",
             parse_mode="HTML",
         )
         await _BOT_APP.bot.send_message(
             chat_id=chat_id,
-            text=(
-                "¿Cuántos ambientes buscás?\n"
-                "Ej: <b>2</b>, <b>2 a 3</b>, <b>3+</b>, <b>monoambiente</b>"
-            ),
-            parse_mode="HTML",
+            text="¿Qué tipo de propiedad buscás?",
+            reply_markup=_tipo_keyboard("maptipo_"),
         )
     return aiohttp_web.Response(text="ok")
 
@@ -1906,6 +1948,7 @@ def main():
             # Solo para la respuesta de ambientes tras elegir barrios en el mapa.
             # Cualquier otro texto fuera de un flujo cae en fallback_unknown.
             MessageHandler(filters.TEXT & ~filters.COMMAND & MAP_WIZARD_PENDING, receive_description),
+            CallbackQueryHandler(handle_map_tipo, pattern="^maptipo_(depto|casaph|todos)$"),
         ],
         states={
             AWAITING_ZONE_CONFIRM: [
