@@ -901,26 +901,29 @@ def _slug(name: str) -> str:
 
 _ZP_SLUG_FIX = {"paternal": "la-paternal", "villa-gral-mitre": "villa-general-mitre"}
 _ML_SLUG_FIX = {"la-paternal": "paternal", "villa-gral-mitre": "villa-general-mitre"}
-# Localidades del mapa (conurbano.geojson) -> (zona de MercadoLibre, partido).
-# Si la localidad es la cabecera del partido, se busca en todo el partido.
-_GBA = {}
+# Localidades del mapa (conurbano.geojson) -> búsquedas de MercadoLibre, SIEMPRE por
+# localidad (nunca el partido entero). Formato: "Nombre en el mapa[=slug ML]"; varios
+# slugs con "+". Verificado contra las localidades que lista ML en cada partido.
+_GBA = {}          # slug del mapa -> [(zona, partido, slug_ml), ...]
 _GBA_NAMES = {}
 for _zona, _partido, _locs in [
-    ("bsas-gba-norte", "vicente-lopez",      "Florida|Florida Oeste|Munro|Olivos|La Lucila|Vicente López|Villa Martelli"),
-    ("bsas-gba-norte", "san-isidro",         "Martínez|San Isidro|Beccar|Boulogne|Villa Adelina"),
-    ("bsas-gba-norte", "general-san-martin", "General San Martín|Villa Ballester|José León Suárez|San Andrés"),
+    ("bsas-gba-norte", "vicente-lopez",      "Florida|Florida Oeste|Munro|Olivos|La Lucila|Vicente López|Villa Martelli|Villa Adelina"),
+    ("bsas-gba-norte", "san-isidro",         "Martínez|San Isidro|Beccar|Boulogne=boulogne-sur-mer|Villa Adelina"),
+    ("bsas-gba-norte", "general-san-martin", "General San Martín=san-martin-centro|Villa Ballester|José León Suárez=villa-jose-leon-suarez|San Andrés=villa-san-andres"),
     ("bsas-gba-oeste", "tres-de-febrero",    "Caseros|Ciudadela"),
     ("bsas-gba-oeste", "moron",              "Morón|Castelar|Haedo|El Palomar"),
     ("bsas-gba-oeste", "hurlingham",         "Hurlingham"),
     ("bsas-gba-oeste", "la-matanza",         "San Justo|Ramos Mejía|Lomas del Mirador|La Tablada|Villa Luzuriaga|Ciudad Madero"),
-    ("bsas-gba-sur",   "avellaneda",         "Avellaneda|Dock Sud|Gerli|Piñeyro|Crucecita|Sarandí|Villa Domínico|Wilde"),
-    ("bsas-gba-sur",   "lanus",              "Lanús|Lanús Este|Lanús Oeste|Valentín Alsina|Remedios de Escalada|Monte Chingolo"),
+    ("bsas-gba-sur",   "avellaneda",         "Avellaneda|Dock Sud|Gerli|Piñeyro|Crucecita=crucesita|Sarandí|Villa Domínico|Wilde"),
+    ("bsas-gba-sur",   "lanus",              "Lanús=lanus-este+lanus-oeste|Lanús Este|Lanús Oeste|Valentín Alsina|Remedios de Escalada|Monte Chingolo|Gerli"),
     ("bsas-gba-sur",   "lomas-de-zamora",    "Lomas de Zamora|Banfield|Temperley|Turdera|Ingeniero Budge"),
     ("bsas-gba-sur",   "quilmes",            "Quilmes|Bernal|Don Bosco"),
 ]:
     for _l in _locs.split("|"):
-        _GBA[_slug(_l)] = (_zona, _partido)
-        _GBA_NAMES[_slug(_l)] = _l
+        _name, _, _ml = _l.partition("=")
+        for _m in (_ml.split("+") if _ml else [_slug(_name)]):
+            _GBA.setdefault(_slug(_name), []).append((_zona, _partido, _m))
+        _GBA_NAMES[_slug(_name)] = _name
 
 _TIPO_ORDER = (("departamento", "departamentos"), ("ph", "ph"), ("casa", "casas"))
 
@@ -1001,11 +1004,13 @@ def build_search_urls(alert: dict) -> dict:
     caba = [_ML_SLUG_FIX.get(x, x) for x in slugs if x not in _GBA]
     gba: dict = {}
     for x in slugs:
-        if x in _GBA:
-            gba.setdefault(_GBA[x], []).append(x)
+        for zona, partido, ml_slug in _GBA.get(x, []):
+            gba.setdefault((zona, partido), [])
+            if ml_slug not in gba[(zona, partido)]:
+                gba[(zona, partido)].append(ml_slug)
     locations = (["capital-federal/" + "-o-".join(caba)] if caba else [])
-    for (zona, partido), locs in gba.items():
-        locations.append(f"{zona}/{partido}" if partido in locs else f"{zona}/{partido}/{'-o-'.join(locs)}")
+    for (zona, partido), locs in gba.items():      # siempre por localidad, nunca el partido entero
+        locations.append(f"{zona}/{partido}/{'-o-'.join(locs)}")
     suffix = (f"_PriceRange_{min_p}ARS-{rent_cap}ARS" if rent_cap else "") + "_NoIndex_True" \
              + (f"_TOTAL*AREA_{int(m2)}m%C2%B2-*" if m2 else "")
     ml = [f"https://inmuebles.mercadolibre.com.ar/{t}/alquiler/{loc}/{suffix}" for t in tipos for loc in locations]
@@ -2561,6 +2566,12 @@ def _migrate_users():
             _fill_from_old_urls(alert)
             if before != (alert.get("barrios"), alert.get("tipos"), alert.get("min_ambientes"), alert.get("max_ambientes")):
                 log.info("Migración: alerta %s -> barrios %s", alert.get("_id"), alert.get("barrios"))
+                changed = True
+            # URLs v2: ML siempre por localidad (nunca el partido entero)
+            if alert.get("barrios") and alert.get("_urls_v") != 2:
+                alert.update(build_search_urls(alert))
+                alert["_urls_v"] = 2
+                log.info("Migración: alerta %s -> URLs por localidad", alert.get("_id"))
                 changed = True
             # Remove keywords that don't appear in listing cards
             rk = alert.get("require_keywords", [])
