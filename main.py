@@ -1414,10 +1414,9 @@ async def _start_wizard(msg, ctx: ContextTypes.DEFAULT_TYPE):
     """Begin the wizard: ask for property type. `msg` is a Message object."""
     ctx.user_data.pop("wizard", None)
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🏢 Depto",     callback_data="tipo_depto"),
-        InlineKeyboardButton("🏠 Casa",      callback_data="tipo_casa"),
-        InlineKeyboardButton("🏘️ PH",        callback_data="tipo_ph"),
-        InlineKeyboardButton("✅ Cualquiera", callback_data="tipo_todos"),
+        InlineKeyboardButton("🏢 Depto",       callback_data="tipo_depto"),
+        InlineKeyboardButton("🏠 Casa o PH",   callback_data="tipo_casaph"),
+        InlineKeyboardButton("✅ Cualquiera",  callback_data="tipo_todos"),
     ]])
     await msg.reply_text(
         "¿Qué tipo de propiedad buscás?",
@@ -1432,12 +1431,14 @@ async def handle_wizard_tipo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "tipo_depto": "departamento",
         "tipo_casa":  "casa",
         "tipo_ph":    "PH",
+        "tipo_casaph": "casa o PH",
         "tipo_todos": "departamento, PH o casa",
     }
     label_map = {
         "tipo_depto": "🏢 Departamento",
         "tipo_casa":  "🏠 Casa",
         "tipo_ph":    "🏘️ PH",
+        "tipo_casaph": "🏠 Casa o PH",
         "tipo_todos": "✅ Cualquier tipo",
     }
     tipo = tipo_map.get(query.data, "departamento, PH o casa")
@@ -1916,7 +1917,7 @@ def main():
                 MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _receive_description_freetext),
             ],
-            AWAITING_TIPO:         [CallbackQueryHandler(handle_wizard_tipo, pattern="^tipo_(depto|casa|ph|todos)$")],
+            AWAITING_TIPO:         [CallbackQueryHandler(handle_wizard_tipo, pattern="^tipo_(depto|casa|ph|casaph|todos)$")],
             AWAITING_AMBIENTES:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_ambientes)],
             AWAITING_METROS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_metros)],
             AWAITING_PRECIO:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_precio)],
