@@ -393,7 +393,7 @@ def remax_params(alert: dict, user: dict) -> dict:
                                    if re.search(rf"[/-]{slug}[-]", zp)] or list(REMAX_TYPES)
     m = re.search(r"desde-(\d+)-hasta-(\d+)-ambientes", zp)
     return {
-        "barrios": alert.get("barrios") or user.get("zones") or [],
+        "barrios": alert.get("barrios") or [],   # nunca la última zona del mapa: es de otra búsqueda
         "tipos":   tipos,
         "min_amb": alert.get("min_ambientes") or (int(m.group(1)) if m else 0),
         "max_amb": alert.get("max_ambientes") or (int(m.group(2)) if m else 0),
@@ -891,6 +891,7 @@ _ML_SLUG_FIX = {"la-paternal": "paternal", "villa-gral-mitre": "villa-general-mi
 # Localidades del mapa (conurbano.geojson) -> (zona de MercadoLibre, partido).
 # Si la localidad es la cabecera del partido, se busca en todo el partido.
 _GBA = {}
+_GBA_NAMES = {}
 for _zona, _partido, _locs in [
     ("bsas-gba-norte", "vicente-lopez",      "Florida|Florida Oeste|Munro|Olivos|La Lucila|Vicente López|Villa Martelli"),
     ("bsas-gba-norte", "san-isidro",         "Martínez|San Isidro|Beccar|Boulogne|Villa Adelina"),
@@ -906,12 +907,46 @@ for _zona, _partido, _locs in [
 ]:
     for _l in _locs.split("|"):
         _GBA[_slug(_l)] = (_zona, _partido)
+        _GBA_NAMES[_slug(_l)] = _l
 
 _TIPO_ORDER = (("departamento", "departamentos"), ("ph", "ph"), ("casa", "casas"))
 
+_CABA_BARRIOS = ("Agronomia|Almagro|Balvanera|Barracas|Belgrano|Boedo|Caballito|Chacarita|Coghlan|Colegiales|"
+                 "Constitucion|Flores|Floresta|La Boca|Liniers|Mataderos|Monserrat|Monte Castro|Nueva Pompeya|"
+                 "Nuñez|Palermo|Parque Avellaneda|Parque Chacabuco|Parque Chas|Parque Patricios|Paternal|"
+                 "Puerto Madero|Recoleta|Retiro|Saavedra|San Cristobal|San Nicolas|San Telmo|Velez Sarsfield|"
+                 "Versalles|Villa Crespo|Villa Del Parque|Villa Devoto|Villa Gral. Mitre|Villa Lugano|Villa Luro|"
+                 "Villa Ortuzar|Villa Pueyrredon|Villa Real|Villa Riachuelo|Villa Santa Rita|Villa Soldati|Villa Urquiza")
+_PLACES = {_slug(n): n for n in _CABA_BARRIOS.split("|")}           # slug -> nombre del mapa
+_PLACES.update({_ZP_SLUG_FIX.get(k, k): v for k, v in list(_PLACES.items())})
+_PLACES.update({"villa-general-mitre": "Villa Gral. Mitre", "belgrano-r": "Belgrano"})
+_PLACES.update(_GBA_NAMES)
+
+def _barrios_from_zonaprop(url: str) -> list:
+    """Barrios de una URL vieja de ZonaProp ('...-alquiler-agronomia-villa-crespo-desde-...')."""
+    m = re.search(r"-alquiler-(.+?)(?:-desde-\d|-mas-\d|-\d+-\d+-pesos|-orden-|\.html)", url or "")
+    if not m:
+        return []
+    rest, found = m.group(1), []
+    keys = sorted(_PLACES, key=len, reverse=True)
+    while rest:
+        k = next((k for k in keys if rest == k or rest.startswith(k + "-")), None)
+        if not k:                       # parte desconocida: saltear hasta el próximo guion
+            rest = rest.split("-", 1)[1] if "-" in rest else ""
+            continue
+        found.append(_PLACES[k])
+        rest = rest[len(k) + 1:]
+    return list(dict.fromkeys(found))
+
 def _fill_from_old_urls(alert: dict):
-    """Alertas viejas: tipos y ambientes estaban solo dentro de la URL de ZonaProp."""
+    """Alertas viejas: barrios, tipos y ambientes estaban solo dentro de la URL de ZonaProp."""
     zp = " ".join(alert.get("zonaprop_urls") or [])
+    if not alert.get("barrios"):
+        found = []
+        for u in alert.get("zonaprop_urls") or []:
+            found += _barrios_from_zonaprop(u)
+        if found:
+            alert["barrios"] = list(dict.fromkeys(found))
     if not alert.get("tipos") and zp:
         found = [t for t, slug in _TIPO_ORDER if re.search(rf"[/-]{slug}-", zp)]
         if found:
@@ -2295,6 +2330,12 @@ def _migrate_users():
             # Add _id if missing
             if "_id" not in alert:
                 alert["_id"] = uuid.uuid4().hex[:8]
+                changed = True
+            # Alertas viejas: barrios/tipos/ambientes solo en la URL de ZonaProp
+            before = (alert.get("barrios"), alert.get("tipos"), alert.get("min_ambientes"), alert.get("max_ambientes"))
+            _fill_from_old_urls(alert)
+            if before != (alert.get("barrios"), alert.get("tipos"), alert.get("min_ambientes"), alert.get("max_ambientes")):
+                log.info("Migración: alerta %s -> barrios %s", alert.get("_id"), alert.get("barrios"))
                 changed = True
             # Remove keywords that don't appear in listing cards
             rk = alert.get("require_keywords", [])
