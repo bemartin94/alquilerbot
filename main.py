@@ -2101,6 +2101,13 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
     for alert in get_alerts(user):
         if only_alert and alert.get("_id") != only_alert:
             continue
+        # Si el usuario la borró (o pausó todo) mientras corría la revisión, no seguir.
+        current = load_users().get(chat_id, {})
+        if alert.get("_id") and alert["_id"] not in {a.get("_id") for a in get_alerts(current)}:
+            log.info("Alerta %s borrada durante la revisión, la salteo", alert.get("_id"))
+            continue
+        if not only_alert and not current.get("active", True):
+            break
         sources = (
             [("zonaprop",     _apply_alert_params(u, alert)) for u in alert.get("zonaprop_urls", [])]
             + [("argenprop",  u) for u in [argenprop_url(alert, remax_params(alert, user))] if u]
@@ -2159,6 +2166,8 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
                     )
                     seen.add(l["id"])
                     total += 1
+                    log.info("Enviado a %s | alerta %r | %s %s | %s", chat_id[-4:], alert.get("name"),
+                             l.get("tipo", ""), l["id"], l.get("address", "")[:50])
                     await asyncio.sleep(0.4)
                 except Exception as e:
                     log.error("Error sending to %s: %s", chat_id, e)
