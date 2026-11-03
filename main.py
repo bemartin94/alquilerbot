@@ -59,6 +59,7 @@ AWAITING_EXTRAS       = 11
 AWAITING_EDIT_CHOICE  = 12
 AWAITING_EDIT_FIELD   = 13
 AWAITING_INITIAL_SEND = 14
+AWAITING_DUENO        = 15
 INITIAL_SEND_DAYS     = 7   # "las de la última semana" al guardar una alerta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -219,6 +220,29 @@ def _expenses_info(structured: str, text: str = "") -> tuple[str, str]:
         return "", EXP_NONE      # el anunciante cargó 0 (o $1) de expensas
     return "", ""
 
+# ── Dueño directo ──────────────────────────────────────────────────────────────
+_OWNER_TEXT_RE = re.compile(
+    r"due[ñn][oa]\s+directo|due[ñn][oa]\s+alquila|alquila\s+due[ñn][oa]|sin\s+comisi[oó]n|"
+    r"inmobiliarias\s+abstenerse|abstenerse\s+inmobiliarias|trato\s+directo\s+con\s+(?:el\s+)?due[ñn]",
+    re.IGNORECASE)
+_AGENCY_NAME_RE = re.compile(
+    r"propiedades|inmobiliari|real\s*estate|bienes\s+ra[ií]ces|broker|negocios|desarrollos|"
+    r"\bs\.?\s?a\.?$|\bs\.?r\.?l\.?|\bgroup\b|grupo|estudio|asociados|remax|re/max",
+    re.IGNORECASE)
+
+def _owner_from_text(text: str) -> bool:
+    return bool(_OWNER_TEXT_RE.search(text or ""))
+
+def _argenprop_owner(publisher: str, text: str) -> bool:
+    """ArgenProp muestra a los particulares como nombre + inicial ("Marcelo Jose O")
+    y a las inmobiliarias con el nombre completo."""
+    name = (publisher or "").strip()
+    if _AGENCY_NAME_RE.search(name):
+        return False
+    if re.search(r"\s[A-Za-zÁÉÍÓÚÑáéíóúñ]\.?$", name):
+        return True
+    return _owner_from_text(text)
+
 # Cloudflare on Fly IPs rejects some profiles intermittently; sessions keep the clearance cookies once one passes.
 _IMPERSONATE = ("chrome131", "chrome124")  # max 2 tries per cycle: bursts are what trigger blocks
 _sessions: dict = {}
@@ -242,10 +266,27 @@ def fetch(url: str, referer: str) -> BeautifulSoup | None:
     log.error("Fetch error (%s): all profiles failed", url)
     return None
 
+def _zonaprop_owner_flags(soup) -> dict:
+    """postingId -> True si ZonaProp lo marca como "Dueño directo"."""
+    script = soup.find("script", string=re.compile(r"__PRELOADED_STATE__"))
+    if not script or not script.string:
+        return {}
+    try:
+        src = script.string
+        start = re.search(r"__PRELOADED_STATE__\s*=\s*", src).end()
+        state, _ = json.JSONDecoder().raw_decode(src, start)
+        posts = state["listStore"]["listPostings"]
+    except Exception as e:
+        log.warning("[ZonaProp] no pude leer el JSON de la página: %s", e)
+        return {}
+    return {str(p.get("postingId")): any(f.get("featureId") == "duenoDirecto" for f in (p.get("flagsFeatures") or []))
+            for p in posts}
+
 def scrape_zonaprop(url: str) -> list[dict]:
     soup = fetch(url, "https://www.zonaprop.com.ar/")
     if not soup:
         return []
+    owners  = _zonaprop_owner_flags(soup)
     results = []
     for card in soup.select("div[data-id]"):
         listing_id = card.get("data-id", "").strip()
@@ -264,7 +305,9 @@ def scrape_zonaprop(url: str) -> list[dict]:
             link = f"https://www.zonaprop.com.ar{path}" if path.startswith("/") else path
         else:
             link = f"https://www.zonaprop.com.ar/propiedades/clasificado/{listing_id}.html"
-        results.append(_listing(f"zp_{listing_id}", address, price, expenses, features, link, _days_ago(pub_text), exp_note))
+        l = _listing(f"zp_{listing_id}", address, price, expenses, features, link, _days_ago(pub_text), exp_note)
+        l["owner"] = owners.get(listing_id) or _owner_from_text(card.get_text(" ", strip=True))
+        results.append(l)
     log.info("[ZonaProp] %d listings", len(results))
     return results
 
@@ -397,7 +440,7 @@ def scrape_remax(alert: dict, params: dict) -> list[dict]:
             features,
             f"https://www.remax.com.ar/listings/{l.get('slug', l['id'])}",
             expenses_note=exp_note,
-        ), "tipo": "PH" if type_id == 12 else "Casa" if type_id in (9, 10, 11) else "Depto"})
+        ), "owner": False, "tipo": "PH" if type_id == 12 else "Casa" if type_id in (9, 10, 11) else "Depto"})
     log.info("[Remax] %d raw, %d in barrios", len(raw), len(results))
     return results
 
@@ -467,7 +510,9 @@ def _parse_argenprop_cards(cards) -> list[dict]:
         if not price:
             continue
         pub_text = _text(card, "[class*='date'], [class*='time'], [class*='fecha'], [class*='publicad']")
-        results.append(_listing(f"ap_{uid}", address, price, expenses, features, href, _days_ago(pub_text), exp_note))
+        l = _listing(f"ap_{uid}", address, price, expenses, features, href, _days_ago(pub_text), exp_note)
+        l["owner"] = _argenprop_owner(_text(card, ".card__agent-name"), card.get_text(" ", strip=True))
+        results.append(l)
     return results
 
 def fetch_ml_expenses(url: str) -> tuple[str, str] | None:
@@ -484,7 +529,16 @@ def fetch_ml_expenses(url: str) -> tuple[str, str] | None:
             table_val = _clean(value.get_text(strip=True))
             break
     desc = soup.select_one("p.ui-pdp-description__content")
-    return _expenses_info(table_val, desc.get_text(" ", strip=True) if desc else "")
+    desc = desc.get_text(" ", strip=True) if desc else ""
+    seller = soup.find(string=re.compile(r'"seller_type"\s*:'))
+    m = re.search(r'"seller_type"\s*:\s*"(\w+)"', str(seller or ""))
+    if m:
+        _ml_owner_cache[url] = m.group(1) != "real_estate_agency" or _owner_from_text(desc)
+    elif _owner_from_text(desc):
+        _ml_owner_cache[url] = True
+    return _expenses_info(table_val, desc)
+
+_ml_owner_cache: dict = {}   # link -> es dueño directo (se llena al abrir el detalle)
 
 def fetch_remax_expenses(link: str) -> tuple[str, str] | None:
     """(expensas, nota) desde el detalle de Remax (API findBySlug: expensesPrice +
@@ -626,6 +680,9 @@ def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_
                 and not l.get("expenses_note") and rent > max_t * DEPTO_UNKNOWN_EXP_MAX_SHARE):
             continue  # depto en el límite con expensas no informadas
         if max_t and total > max_t:
+            continue
+        # Solo dueño directo (excluyente): si no está confirmado, no entra.
+        if alert.get("solo_dueno") and l.get("owner") is not True:
             continue
         # Reject "reservado" anywhere in the listing text
         text = f"{l['address']} {l['features']}".lower()
@@ -830,8 +887,10 @@ NO inventes una búsqueda. Devolvé exactamente: {"no_es_busqueda": true}
   "min_ambientes": 1,
   "max_ambientes": 3,
   "require_keywords": [],
-  "exclude_keywords": []
+  "exclude_keywords": [],
+  "solo_dueno": false
 }
+`solo_dueno`: true solo si el usuario pide publicaciones de dueño directo / sin inmobiliarias.
 `barrios`: nombres de barrio/localidad tal como se escriben normalmente (con tildes), uno por elemento.
 `tipos`: subconjunto de ["departamento", "ph", "casa"].
 `min_ambientes`/`max_ambientes`: rango de ambientes pedido (monoambiente = 1); 0 si no se especificó.
@@ -999,6 +1058,7 @@ def _edit_menu_kb(aid: str) -> InlineKeyboardMarkup:
         [b("📐 Metros mínimos", "m2"),   b("💰 Presupuesto", "precio")],
         [b("🏢 Tipo propiedad", "tipo"), b("🛏️ Ambientes", "ambientes")],
         [b("📍 Zona", "zona"),           b("✨ Extras / keywords", "extras")],
+        [b("👤 Dueño directo sí/no", "dueno")],
         [b("❌ Cancelar", "cancel")],
     ])
 
@@ -1015,6 +1075,7 @@ async def _show_edit_menu(send_fn, alert: dict, idx: int):
         lines.append(f"💰 Alquiler máx: {_fmt_ars(rent_cap)}")
     if alert.get("require_keywords"):
         lines.append(f"✨ Extras: {', '.join(alert['require_keywords'])}")
+    lines.append("👤 Solo dueño directo" if alert.get("solo_dueno") else "🤝 Dueños e inmobiliarias")
     lines.append("\n¿Qué querés cambiar?")
     await send_fn("\n".join(lines), parse_mode="HTML", reply_markup=_edit_menu_kb(aid))
 
@@ -1082,6 +1143,8 @@ def _alert_params_line(a: dict) -> str:
         parts.append(f"💰 hasta {_fmt_ars(total_cap)} total")
     elif rent_cap:
         parts.append(f"💰 hasta {_fmt_ars(rent_cap)} de alquiler")
+    if a.get("solo_dueno"):
+        parts.append("👤 solo dueño directo")
     return " · ".join(parts)
 
 def _refresh_alert_text(alert: dict, field: str):
@@ -1266,6 +1329,20 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(query.from_user.id)
     await query.answer()
     data, _, aid = query.data.partition(":")
+
+    if data == "ef_dueno":   # alterna solo dueño directo / indistinto
+        users  = load_users()
+        alerts = get_alerts(users.get(chat_id)) if users.get(chat_id) else []
+        idx    = _find_alert_idx(alerts, aid) if aid else -1
+        if idx is None or idx < 0 or idx >= len(alerts):
+            await query.edit_message_text("⚠️ Esa alerta ya no existe. Usá /alertas para ver las actuales.")
+            return ConversationHandler.END
+        alerts[idx]["solo_dueno"] = not alerts[idx].get("solo_dueno")
+        save_users(users)
+        await query.edit_message_text(
+            "👤 Ahora solo te mando publicaciones de <b>dueño directo</b>." if alerts[idx]["solo_dueno"]
+            else "🤝 Ahora te mando publicaciones de <b>dueños e inmobiliarias</b>.", parse_mode="HTML")
+        return ConversationHandler.END
 
     if data == "ef_cancel":
         await query.edit_message_text("Edición cancelada.")
@@ -1513,12 +1590,32 @@ async def handle_wizard_precio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     wizard["precio_raw"] = _normalize_precio(update.message.text)
     wizard["expensas_incluidas"] = True
     await update.message.reply_text(
+        "¿Querés solo publicaciones de <b>dueño directo</b>?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("👤 Solo dueño directo", callback_data="dueno_si"),
+            InlineKeyboardButton("🤝 Indistinto",         callback_data="dueno_no"),
+        ]]),
+    )
+    return AWAITING_DUENO
+
+async def handle_wizard_dueno(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    solo = query.data == "dueno_si"
+    ctx.user_data.setdefault("wizard", {})["solo_dueno"] = solo
+    await query.edit_message_text("👤 Solo dueño directo" if solo else "🤝 Dueño directo o inmobiliaria")
+    await query.message.reply_text(
         "¿Necesitás algo especial?\n"
         "Ej: <b>cochera</b>, <b>balcón</b>, <b>luminoso</b>, <b>terraza</b> "
         "(o escribí <b>no</b> si no hay nada más)",
         parse_mode="HTML",
     )
     return AWAITING_EXTRAS
+
+async def handle_wizard_dueno_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Elegí una de las dos opciones de arriba 👆")
+    return AWAITING_DUENO
 
 async def handle_wizard_extras(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -1544,6 +1641,8 @@ async def handle_wizard_extras(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parts.append(f"hasta {wizard['precio_raw']}{sufijo}")
     if wizard.get("extras"):
         parts.append(f"que tenga {wizard['extras']}")
+    if wizard.get("solo_dueno"):
+        parts.append("solo de dueño directo")
 
     desc = ", ".join(parts)
     if zones:
@@ -1562,6 +1661,7 @@ async def handle_wizard_extras(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Stamp wizard intent so _show_confirmation shows the right price label
     if "expensas_incluidas" in wizard:
         result["_expensas_incluidas"] = wizard["expensas_incluidas"]
+    result["solo_dueno"] = bool(wizard.get("solo_dueno"))
 
     return await _show_confirmation(update, ctx, result)
 
@@ -1707,6 +1807,13 @@ def _keep_uncorrected(result: dict, prev: dict, correction: str, total_default: 
                 result.pop(k, None)
         if _price_limits(result)[1]:
             _refresh_alert_text(result, "max_total_price")
+    if "solo_dueno" in prev:
+        if re.search(r"due[ñn]o|particular", correction, re.IGNORECASE):
+            result["solo_dueno"] = not re.search(r"\bno\b|indistinto|cualquiera|tambi[eé]n\s+inmobiliaria", correction, re.IGNORECASE)
+        elif re.search(r"inmobiliaria|indistinto", correction, re.IGNORECASE):
+            result["solo_dueno"] = False
+        else:
+            result["solo_dueno"] = prev["solo_dueno"]
     if not _CORR_M2_RE.search(correction) and prev.get("min_m2"):
         result["min_m2"] = prev["min_m2"]
         _refresh_alert_text(result, "min_m2")
@@ -1832,7 +1939,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             [("zonaprop",     _apply_alert_params(u, alert)) for u in alert.get("zonaprop_urls", [])]
             + [("argenprop",  u) for u in [argenprop_url(alert, remax_params(alert, user))] if u]
             + [("mercadolibre", _apply_alert_params(u, alert)) for u in alert.get("mercadolibre_urls", [])]
-            + [("remax", None)]
+            + ([] if alert.get("solo_dueno") else [("remax", None)])   # Remax: solo inmobiliarias
         )
         for scraper_name, url in sources:
             if scraper_name == "zonaprop":
@@ -1852,14 +1959,18 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             if detail:
                 # Expensas sin informar en el listado: se revisa la publicación
                 # (campo + descripción). Solo nuevas y que entren por alquiler.
-                rent_cap = _price_limits(alert)[0]
+                rent_cap  = _price_limits(alert)[0]
+                need_owner = alert.get("solo_dueno") and scraper_name == "mercadolibre"
                 for l in listings:
-                    if (l["expenses"] or l.get("expenses_note") or l["id"] in seen
-                            or (rent_cap and _parse_price(l["price"]) > rent_cap)):
+                    if l["id"] in seen or (rent_cap and _parse_price(l["price"]) > rent_cap):
+                        continue
+                    if (l["expenses"] or l.get("expenses_note")) and not need_owner:
                         continue
                     info = await loop.run_in_executor(None, lambda link=l["link"], f=detail: f(link))
-                    if info:
+                    if info and not (l["expenses"] or l.get("expenses_note")):
                         l["expenses"], l["expenses_note"] = info
+                    if scraper_name == "mercadolibre":
+                        l["owner"] = _ml_owner_cache.pop(l["link"], None)
 
             for l in listings:
                 l.setdefault("tipo", _infer_tipo(l["link"], url or ""))
@@ -2020,6 +2131,10 @@ def main():
             AWAITING_AMBIENTES:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_ambientes)],
             AWAITING_METROS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_metros)],
             AWAITING_PRECIO:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_precio)],
+            AWAITING_DUENO:        [
+                CallbackQueryHandler(handle_wizard_dueno, pattern="^dueno_(si|no)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_dueno_text),
+            ],
             AWAITING_EXTRAS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_extras)],
             AWAITING_CONFIRMATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirmation)],
             AWAITING_INITIAL_SEND: [
