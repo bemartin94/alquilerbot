@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import datetime
 import unicodedata
 import uuid
 from urllib.parse import quote
@@ -256,6 +257,8 @@ def _session(imp: str):
         _sessions[imp] = cffi_requests.Session(impersonate=imp)
     return _sessions[imp]
 
+_fetch_failures: set = set()   # URLs que no respondieron (bloqueo, error) en la pasada actual
+
 def fetch(url: str, referer: str) -> BeautifulSoup | None:
     for imp in _IMPERSONATE:
         try:
@@ -268,6 +271,7 @@ def fetch(url: str, referer: str) -> BeautifulSoup | None:
         except Exception as e:
             log.warning("Fetch %s (%s): %s", url, imp, e)
     log.error("Fetch error (%s): all profiles failed", url)
+    _fetch_failures.add(url)
     return None
 
 def _zonaprop_owner_flags(soup) -> dict:
@@ -406,6 +410,7 @@ def scrape_remax(alert: dict, params: dict) -> list[dict]:
                 raw += resp.json()["data"]["data"]
             except Exception as e:
                 log.warning("[Remax] fetch failed (%s): %s", url, e)
+                _fetch_failures.add(url)
                 break
 
     results = []
@@ -2009,14 +2014,16 @@ async def handle_initial_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                               silent=only_new, max_age=INITIAL_SEND_DAYS)
     save_users(users)
     release_memory()
+    note = _failed_note(chat_id)
     if only_new:
-        await send("Listo. Voy a revisar cada 15 minutos y te aviso apenas aparezca algo nuevo.")
+        await send("Listo. Voy a revisar cada 15 minutos y te aviso apenas aparezca algo nuevo." + note)
     elif count == 0:
-        await send("No encontré publicaciones de la última semana que coincidan. "
-                   "Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo.")
+        await send(("No encontré publicaciones de la última semana que coincidan"
+                    + (" en los sitios que respondieron." if note else ".")
+                    + " Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo.") + note)
     else:
         await send(f"Te mandé {count} publicación(es) de la última semana. "
-                   "Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo.")
+                   "Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo." + note)
     await send("💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento.")
     await ctx.bot.send_message(
         query.message.chat_id, "¿Querés agregar otra alerta con distintos criterios?",
@@ -2054,6 +2061,17 @@ async def handle_more_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ── Scraper job ────────────────────────────────────────────────────────────────
+SOURCE_NAMES   = {"zonaprop": "ZonaProp", "argenprop": "ArgenProp", "mercadolibre": "MercadoLibre", "remax": "Remax"}
+failed_sources: dict = {}   # chat_id -> sitios que no respondieron en su última revisión
+
+def _failed_note(chat_id: str) -> str:
+    f = sorted(failed_sources.get(chat_id, ()))
+    if not f:
+        return ""
+    sitios = " y ".join([", ".join(f[:-1]), f[-1]]) if len(f) > 1 else f[0]
+    return (f"\n\n⚠️ {sitios} no {'respondieron' if len(f) > 1 else 'respondió'} ahora "
+            "(suelen bloquear un rato). Los vuelvo a revisar en cada vuelta y te aviso si aparece algo.")
+
 async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: str | None = None,
                       silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS) -> int:
     """Scrape the user's alerts (or only `only_alert`, by _id). Returns how many
@@ -2062,6 +2080,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
     seen  = set(user.get("seen", []))
     total = 0
     loop  = asyncio.get_event_loop()
+    failed_sources.pop(chat_id, None)
 
     for alert in get_alerts(user):
         if only_alert and alert.get("_id") != only_alert:
@@ -2073,6 +2092,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             + ([] if alert.get("solo_dueno") else [("remax", None)])   # Remax: solo inmobiliarias
         )
         for scraper_name, url in sources:
+            _fetch_failures.clear()
             if scraper_name == "zonaprop":
                 listings = scrape_zonaprop(url)
             elif scraper_name == "remax":
@@ -2086,6 +2106,8 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             else:
                 listings = scrape_mercadolibre(url)
 
+            if _fetch_failures and not listings:
+                failed_sources.setdefault(chat_id, set()).add(SOURCE_NAMES[scraper_name])
             if silent:
                 seen.update(l["id"] for l in listings)
                 continue
@@ -2356,6 +2378,9 @@ def main():
         jitter=120,
         id="scraper",
         args=[app],
+        # Primera vuelta a los 2 min: si el bot se reinicia seguido (deploys),
+        # el intervalo de 15 min no llega a cumplirse nunca.
+        next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=2),
     )
     scheduler.start()
     log.info("Bot iniciado. Scrapeando cada 15 minutos.")
