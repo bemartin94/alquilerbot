@@ -262,7 +262,7 @@ def scrape_remax(alert: dict, params: dict) -> list[dict]:
         return []
     type_ids = ",".join(REMAX_TYPES[t] for t in params["tipos"] if t in REMAX_TYPES)
     min_p = alert.get("min_price", 200000)
-    max_p = alert.get("max_rent_price") or alert.get("max_total_price") or 10**9
+    max_p = _price_limits(alert)[0] or 10**9
     rate  = usd_ars_rate()
 
     queries = [("2", min_p, max_p, 2)]
@@ -333,7 +333,7 @@ def argenprop_url(alert: dict, params: dict) -> str | None:
     if params["max_amb"]:
         amb = range(max(params["min_amb"], 1), min(params["max_amb"], 5) + 1)
         parts.append("-o-".join("monoambiente" if n == 1 else f"{n}-ambientes" for n in amb))
-    max_p = alert.get("max_rent_price") or alert.get("max_total_price")
+    max_p = _price_limits(alert)[0]
     if max_p:
         parts.append(f"pesos-{alert.get('min_price', 0)}-{max_p}")
     parts.append("orden-masnuevos")
@@ -418,10 +418,42 @@ def _matches_exclude(text: str, rules: list) -> bool:
 
 MAX_LISTING_AGE_DAYS = 14
 
+def _price_limits(alert: dict) -> tuple[int, int]:
+    """(tope de alquiler, tope total) de una alerta.
+
+    - Presupuesto TOTAL (alquiler + expensas): se buscan alquileres hasta el total
+      y después se filtra por alquiler + expensas reales. Sin expensas cuenta solo
+      el alquiler. Tope total = presupuesto.
+    - Solo ALQUILER: tope de alquiler = presupuesto, sin tope total.
+
+    Alertas viejas guardaban 80%/120% del presupuesto; el modo se deduce del
+    flag del wizard o de esa proporción (total → t/r = 1.25, alquiler → 1.2)."""
+    max_t = alert.get("max_total_price") or 0
+    max_r = alert.get("max_rent_price") or 0
+    total_mode = alert.get("_expensas_incluidas")
+    if total_mode is None:
+        if max_t and max_r:
+            total_mode = max_t / max_r >= 1.225 or max_t == max_r
+        else:
+            total_mode = bool(max_t)
+    if total_mode and max_t:
+        return max_t, max_t
+    return (max_r or max_t), 0
+
+def _apply_price_cap(url: str, alert: dict) -> str:
+    """Reescribe el precio máximo de una URL de búsqueda guardada con el tope
+    actual (las alertas viejas tienen el 80% del presupuesto en la URL)."""
+    cap, _ = _price_limits(alert)
+    if not cap or not url:
+        return url
+    url = re.sub(r"-(\d+)-\d+-pesos", rf"-\g<1>-{cap}-pesos", url)              # ZonaProp
+    url = re.sub(r"(_PriceRange_\d+ARS-)\d+(ARS)", rf"\g<1>{cap}\g<2>", url)      # MercadoLibre
+    url = re.sub(r"(--precio-desde-\d+-hasta-)\d+", rf"\g<1>{cap}", url)          # ArgenProp
+    return url
+
 def filter_listings(listings: list, alert: dict) -> list:
     min_p    = alert.get("min_price", 200000)
-    max_t    = alert.get("max_total_price", 0)
-    max_r    = alert.get("max_rent_price", 0)
+    max_r, max_t = _price_limits(alert)
     min_m2   = alert.get("min_m2", 0)
     required = [kw.lower() for kw in alert.get("require_keywords", [])]
     excluded = [kw.lower() for kw in alert.get("exclude_keywords", [])]
@@ -444,11 +476,8 @@ def filter_listings(listings: list, alert: dict) -> list:
             if m2_match and int(m2_match.group(1)) < min_m2:
                 continue
 
-        exp_parsed = _parse_price(l["expenses"])
-        # If max_total is set and expenses aren't shown, estimate 25% of rent conservatively
-        if max_t and not l["expenses"] and rent > 0:
-            exp_parsed = int(rent * 0.25)
-        total = rent + exp_parsed
+        # Expensas reales; si la publicación no tiene, cuenta solo el alquiler.
+        total = rent + _parse_price(l["expenses"])
         if max_t and total > max_t:
             continue
         # Reject "reservado" anywhere in the listing text
@@ -576,10 +605,11 @@ Luego aplicá las reglas:
 
 Casos:
 1. "hasta 800k incluyendo expensas" / "todo incluido" / "en total" / "con expensas":
-   → max_total_price = 800000, max_rent_price = 640000 (80%)
+   → max_total_price = 800000, max_rent_price = 800000
+   (se buscan alquileres hasta 800k y después se filtra por alquiler + expensas)
 
 2. "hasta 800k de alquiler" / solo alquiler / sin aclaración:
-   → max_rent_price = 800000, max_total_price = 960000 (120%)
+   → max_rent_price = 800000, max_total_price = 0
 
 3. No especifica: tratalo como caso 2.
 
@@ -641,7 +671,7 @@ NO inventes una búsqueda. Devolvé exactamente: {"no_es_busqueda": true}
   "argenprop_urls": ["url1"],
   "mercadolibre_urls": ["url1"],
   "min_price": 200000,
-  "max_rent_price": 640000,
+  "max_rent_price": 800000,
   "max_total_price": 800000,
   "min_m2": 30,
   "barrios": ["Villa Urquiza", "Saavedra"],
@@ -812,10 +842,11 @@ async def _show_edit_menu(send_fn, alert: dict, idx: int):
     lines = [f"✏️ <b>Editando alerta {idx+1}: {name}</b>", ""]
     if alert.get("min_m2"):
         lines.append(f"📐 Metros mín: {alert['min_m2']} m²")
-    if alert.get("max_total_price"):
-        lines.append(f"💰 Presupuesto máx total: ${alert['max_total_price']:,}")
-    elif alert.get("max_rent_price"):
-        lines.append(f"💰 Alquiler máx: ${alert['max_rent_price']:,}")
+    rent_cap, total_cap = _price_limits(alert)
+    if total_cap:
+        lines.append(f"💰 Presupuesto máx total: ${total_cap:,}")
+    elif rent_cap:
+        lines.append(f"💰 Alquiler máx: ${rent_cap:,}")
     if alert.get("require_keywords"):
         lines.append(f"✨ Extras: {', '.join(alert['require_keywords'])}")
     lines.append("\n¿Qué querés cambiar?")
@@ -1097,7 +1128,8 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         if val < 10_000:   # assume "thousands" if bare number
             val *= 1000
         alert["max_total_price"] = val
-        alert["max_rent_price"]  = int(val * 0.8)
+        alert["max_rent_price"]  = val
+        alert["_expensas_incluidas"] = True
         save_users(users)
         await update.message.reply_text(f"Presupuesto máximo actualizado a <b>${val:,}</b>.", parse_mode="HTML")
         return ConversationHandler.END
@@ -1294,23 +1326,12 @@ async def handle_wizard_extras(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, result: dict):
     """Save pending result and show confirmation with price note."""
     ctx.user_data["pending"] = result
-    max_r = result.get("max_rent_price", 0)
-    max_t = result.get("max_total_price", 0)
-    expensas_incluidas = result.get("_expensas_incluidas")  # set by wizard
-    if max_t and expensas_incluidas is True:
-        fmt_t = f"${max_t:,.0f}".replace(",", ".")
-        price_note = f"💰 Precio: hasta {fmt_t} en total (alquiler + expensas)"
-    elif max_r and expensas_incluidas is False:
-        fmt_r = f"${max_r:,.0f}".replace(",", ".")
-        price_note = f"💰 Precio: hasta {fmt_r} de alquiler, sin contar expensas"
-    elif max_r and max_t:
-        # free-text path: guess from ratio
-        fmt_r = f"${max_r:,.0f}".replace(",", ".")
-        fmt_t = f"${max_t:,.0f}".replace(",", ".")
-        if (max_t / max_r) < 1.15:
-            price_note = f"💰 Precio: hasta {fmt_t} en total (alquiler + expensas)"
-        else:
-            price_note = f"💰 Precio: hasta {fmt_r} de alquiler, sin contar expensas"
+    rent_cap, total_cap = _price_limits(result)
+    fmt = lambda v: f"${v:,.0f}".replace(",", ".")
+    if total_cap:
+        price_note = f"💰 Precio: hasta {fmt(total_cap)} en total (alquiler + expensas)"
+    elif rent_cap:
+        price_note = f"💰 Precio: hasta {fmt(rent_cap)} de alquiler, sin contar expensas"
     else:
         price_note = ""
     msg = f"Esto es lo que entendí:\n\n<b>{result['summary']}</b>\n\n"
@@ -1464,9 +1485,9 @@ async def scrape_user(app: Application, chat_id: str, user: dict) -> int:
 
     for alert in get_alerts(user):
         sources = (
-            [("zonaprop",     u) for u in alert.get("zonaprop_urls",     [])]
+            [("zonaprop",     _apply_price_cap(u, alert)) for u in alert.get("zonaprop_urls", [])]
             + [("argenprop",  u) for u in [argenprop_url(alert, remax_params(alert, user))] if u]
-            + [("mercadolibre", u) for u in alert.get("mercadolibre_urls", [])]
+            + [("mercadolibre", _apply_price_cap(u, alert)) for u in alert.get("mercadolibre_urls", [])]
             + [("remax", None)]
         )
         for scraper_name, url in sources:
