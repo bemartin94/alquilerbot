@@ -168,30 +168,44 @@ _EXP_INCLUDED_RE = re.compile(
     r"\b(?:incluye|incluyen|incluido|incluida|incluidas|incluidos)\s+(?:las\s+)?expensas\b|"
     r"\bexpensas\s+incluidas\b",
     re.IGNORECASE)
-# "Expensas $132. 000 aprox", "expensas: $ 60.000", "$ 60.000 de expensas"
+# Número de expensas: "132.000", "132. 000" (espacio tras el punto), "160", "45000".
+_EXP_NUM = r"(\d{1,3}(?:[.,]\s?\d{3})+|\d{1,7})(?![\d.,]*\s*(?:m2|m²|amb|dorm))"
+# "Expensas $132. 000 aprox", "expensas: $ 60.000", "$ 60.000 de expensas", "Expensas $700"
 _EXP_AMOUNT_RE = re.compile(
-    r"\bexpensas\s*(?:de|:|aprox\.?|aproximadas)?\s*\$\s*(\d[\d.\s]{2,10}\d)|"
-    r"\$\s*(\d[\d.\s]{2,10}\d)\s*(?:de\s+)?expensas\b|"
+    r"\bexpensas\s*(?:de|:|aprox\.?|aproximadas)?\s*\$\s*" + _EXP_NUM + r"|"
+    r"\$\s*" + _EXP_NUM + r"\s*(?:de\s+)?expensas\b|"
     r"\bexpensas\s*[:=]?\s*(?:de\s+)?(\d{1,3}(?:\.\d{3})+)\b",   # "Expensas: 45.000" (sin $)
     re.IGNORECASE)
+
+def _exp_value(val: int) -> int | None:
+    """Normaliza un monto de expensas. 0 o 1 = sin expensas (los portales usan $1
+    como "no tiene"); de 2 a 999 se escribió en miles ("160" = $160.000)."""
+    if val <= 1:
+        return 0
+    if val < 1000:
+        return val * 1000
+    return val if val <= 3_000_000 else None
+
+def _fmt_ars(v: int) -> str:
+    return f"$ {v:,}".replace(",", ".")
 
 def _expenses_info(structured: str, text: str = "") -> tuple[str, str]:
     """(expensas, nota). `expensas` es el monto ("$ 60.000") o "" si no hay monto;
     `nota` es EXP_NONE / EXP_INCLUDED / "" (no informadas).
     Prioridad: monto del campo estructurado > monto en el texto > "sin expensas" /
     "incluidas" en el texto > campo estructurado en 0 > no informadas."""
-    amount = _parse_price(structured) if structured else 0
-    if amount >= 1000:
-        return f"$ {amount:,}".replace(",", "."), ""
+    field = _exp_value(_parse_price(structured)) if structured and re.search(r"\d", structured) else None
+    if field:
+        return _fmt_ars(field), ""
     for m in _EXP_AMOUNT_RE.finditer(text or ""):
-        val = int(re.sub(r"\D", "", next(g for g in m.groups() if g)) or 0)
-        if 1000 <= val <= 3_000_000:
-            return f"$ {val:,}".replace(",", "."), ""
+        val = _exp_value(int(re.sub(r"\D", "", next(g for g in m.groups() if g)) or 0))
+        if val:
+            return _fmt_ars(val), ""
     if _EXP_NONE_RE.search(text or ""):
         return "", EXP_NONE
     if _EXP_INCLUDED_RE.search(text or ""):
         return "", EXP_INCLUDED
-    if structured and re.search(r"\d", structured) and amount < 1000:
+    if field == 0:
         return "", EXP_NONE      # el anunciante cargó 0 (o $1) de expensas
     return "", ""
 
