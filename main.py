@@ -1495,6 +1495,7 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "👤 Ahora solo te mando publicaciones de <b>dueño directo</b>." if alerts[idx]["solo_dueno"]
             else "🤝 Ahora te mando publicaciones de <b>dueños e inmobiliarias</b>.", parse_mode="HTML")
+        await ask_resend(ctx.bot, chat_id, alerts[idx].get("_id"))
         return ConversationHandler.END
 
     if data == "ef_cancel":
@@ -1580,6 +1581,7 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         _refresh_alert_text(alert, "min_m2")
         save_users(users)
         await update.message.reply_text(f"Metros mínimos actualizado a <b>{alert['min_m2']} m² totales</b>.", parse_mode="HTML")
+        await ask_resend(ctx.bot, chat_id, alert.get("_id"))
         return ConversationHandler.END
 
     # Price field: max_total_price
@@ -1609,6 +1611,7 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         _refresh_alert_text(alert, "max_total_price")
         save_users(users)
         await update.message.reply_text(f"Presupuesto máximo actualizado a <b>{_fmt_ars(val)}</b>.", parse_mode="HTML")
+        await ask_resend(ctx.bot, chat_id, alert.get("_id"))
         return ConversationHandler.END
 
     # Keywords field
@@ -1621,6 +1624,7 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         kws = alert["require_keywords"]
         msg = f"Palabras clave actualizadas: <b>{', '.join(kws)}</b>." if kws else "Palabras clave eliminadas."
         await update.message.reply_text(msg, parse_mode="HTML")
+        await ask_resend(ctx.bot, chat_id, alert.get("_id"))
         return ConversationHandler.END
 
     # NLP-based fields (tipo, ambientes, zona): regenerate URLs
@@ -2021,12 +2025,17 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             users = load_users()
             user  = users.get(chat_id)
             if user and "alerts" in user and edit_idx < len(user["alerts"]):
+                old = user["alerts"][edit_idx]
+                alert["_id"] = old.get("_id") or uuid.uuid4().hex[:8]      # mismo id: no es otra alerta
+                alert.setdefault("solo_dueno", old.get("solo_dueno", False))
+                alert["_urls_v"] = 2
                 user["alerts"][edit_idx] = alert
                 save_users(users)
             await reply(
                 f"Alerta actualizada: <b>{alert.get('name') or alert.get('summary','')}</b>",
                 parse_mode="HTML"
             )
+            await ask_resend(ctx.bot, chat_id, alert.get("_id"))
             return ConversationHandler.END
         add_alert(chat_id, alert)
         ctx.user_data["initial_alert_id"] = alert.get("_id")
@@ -2161,7 +2170,7 @@ async def _send_pages(app: Application, chat_id: str, listings: list, start_n: i
             log.error("Error sending page to %s: %s", chat_id, e)
         await asyncio.sleep(0.7)
 
-async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: bool):
+async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: bool, after_edit: bool = False):
     send = lambda text, **kw: app.bot.send_message(int(chat_id), text, **kw)
     try:
         user  = load_users().get(chat_id, {})
@@ -2172,6 +2181,16 @@ async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: 
         release_memory()
         note = _failed_note(chat_id)
         n = len(found)
+        if after_edit:
+            if only_new:
+                await send("Listo, con el filtro nuevo te aviso solo de las publicaciones que aparezcan de acá en adelante." + note)
+            elif n == 0:
+                await send("No hay publicaciones de la última semana con el filtro nuevo que no te haya mandado. "
+                           "Te aviso cuando aparezcan." + note)
+            else:
+                await present_listings(app, chat_id, found, " con el filtro nuevo")
+                await send(f"✅ Esas son las {n} de la última semana con el filtro nuevo. Podés cambiar tus alertas en /alertas." + note)
+            return
         if only_new:
             await send("Listo. Voy a revisar cada 15 minutos y te aviso apenas aparezca algo nuevo." + note)
         elif n == 0:
@@ -2191,6 +2210,27 @@ async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: 
                    ]]))
     except Exception as e:
         log.exception("Envío inicial para %s: %s", chat_id, e)
+
+async def ask_resend(bot, chat_id, aid: str):
+    """Tras editar una alerta: ¿mostrar las de la última semana con el filtro nuevo?"""
+    if not aid:
+        return
+    await bot.send_message(int(chat_id),
+        "¿Querés ver las publicaciones de la última semana con el filtro nuevo?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📬 Sí, mostrame",       callback_data=f"resend_si:{aid}"),
+            InlineKeyboardButton("🔔 No, solo las nuevas", callback_data=f"resend_no:{aid}"),
+        ]]))
+
+async def handle_resend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    chat_id = str(query.message.chat_id)
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    yes, _, aid = query.data.partition(":")
+    only_new = yes == "resend_no"
+    task = asyncio.create_task(_initial_send_job(ctx.application, chat_id, aid, only_new, after_edit=True))
+    _bg_tasks.add(task); task.add_done_callback(_bg_tasks.discard)
 
 async def handle_ver_todos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Botón '📋 Ver todos': manda el resto de los resultados en mensajes de a 5."""
@@ -2491,6 +2531,7 @@ async def _apply_zone_edit(chat_id: str, aid: str, barrios: list):
         alert["name"] = _short_name(alert)
         save_users(users)
         await send(f"✅ Barrios actualizados: <b>{html_mod.escape(lista)}</b>\n{_alert_params_line(alert)}")
+        await ask_resend(_BOT_APP.bot, chat_id, alert.get("_id"))
     except Exception as e:
         log.exception("Edición de zona: %s", e)
         await send("No pude actualizar los barrios. Probá de nuevo desde /alertas → Editar → Zona.")
@@ -2654,6 +2695,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_alert_del_button, pattern=r"^alert_del:[\w]+$"))
     app.add_handler(CallbackQueryHandler(handle_ver_todos, pattern="^ver_todos$"))   # botones viejos
     app.add_handler(CallbackQueryHandler(handle_page, pattern=r"^pg(:\w+:\d+|_noop)$"))
+    app.add_handler(CallbackQueryHandler(handle_resend, pattern=r"^resend_(si|no):\w+$"))
     app.add_handler(CommandHandler("stop",       cmd_stop))
     app.add_handler(CommandHandler("estado",     cmd_estado))
     app.add_handler(CommandHandler("alertas",    cmd_alertas))
