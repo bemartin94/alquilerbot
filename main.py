@@ -2078,26 +2078,62 @@ async def handle_initial_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _bg_tasks.add(task); task.add_done_callback(_bg_tasks.discard)
     return AWAITING_MORE_ALERTS
 
+def _load_more() -> dict:
+    try:
+        return json.loads(MORE_FILE.read_text())
+    except Exception:
+        return {}
+
+def _save_more(d: dict):
+    tmp = MORE_FILE.with_suffix(".tmp"); tmp.write_text(json.dumps(d, ensure_ascii=False)); os.replace(tmp, MORE_FILE)
+
+async def _send_pages(app: Application, chat_id: str, listings: list, start_n: int, total_n: int):
+    """Manda publicaciones en mensajes de a PAGE_SIZE."""
+    for i in range(0, len(listings), PAGE_SIZE):
+        chunk = listings[i:i + PAGE_SIZE]
+        a, b = start_n + i + 1, start_n + i + len(chunk)
+        text = f"📋 {a}-{b} de {total_n}:\n\n" + "\n\n".join(_compact_listing(l) for l in chunk)
+        try:
+            await app.bot.send_message(int(chat_id), text, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as e:
+            log.error("Error sending page to %s: %s", chat_id, e)
+        await asyncio.sleep(0.7)
+
 async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: bool):
     send = lambda text, **kw: app.bot.send_message(int(chat_id), text, **kw)
     try:
         user  = load_users().get(chat_id, {})
-        count = await scrape_user(app, chat_id, user, only_alert=aid, silent=only_new,
-                                  max_age=INITIAL_SEND_DAYS, max_send=INITIAL_MAX_SEND)
+        found: list = []
+        await scrape_user(app, chat_id, user, only_alert=aid, silent=only_new,
+                          max_age=INITIAL_SEND_DAYS, collect=found)
         _merge_seen(chat_id, user.get("seen", []))
         release_memory()
         note = _failed_note(chat_id)
-        more = skipped_sends.get(chat_id, 0)
+        n = len(found)
         if only_new:
             await send("Listo. Voy a revisar cada 15 minutos y te aviso apenas aparezca algo nuevo." + note)
-        elif count == 0:
+        elif n == 0:
             await send(("No encontré publicaciones de la última semana que coincidan"
                         + (" en los sitios que respondieron." if note else ".")
                         + " Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo.") + note)
+        elif n <= INITIAL_CARDS:
+            for l in found:
+                try:
+                    await send(format_listing(l), parse_mode="HTML")
+                except Exception as e:
+                    log.error("Error sending to %s: %s", chat_id, e)
+                await asyncio.sleep(0.4)
+            await send(f"Te mandé {n} publicación(es) de la última semana. "
+                       "Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo." + note)
         else:
-            await send(f"Te mandé {count + more} publicación(es) de la última semana"
-                       + (f": {count} con detalle y {more} más en listas" if more else "")
-                       + ". Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo." + note)
+            first = 3 * PAGE_SIZE
+            await _send_pages(app, chat_id, found[:first], 0, n)
+            more = _load_more(); more[chat_id] = {"items": found[first:], "total": n, "sent": first}; _save_more(more)
+            await send(f"🔎 Encontramos muchos resultados: <b>{n}</b>. Te mostré los primeros {first}.\n"
+                       "¿Querés verlos todos?" + note, parse_mode="HTML",
+                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                           f"📋 Ver todos ({n - first} más)", callback_data="ver_todos")]]))
+        log.info("Envío inicial a %s: %d encontradas", chat_id[-4:], n)
         await send("💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento.")
         await send("¿Querés agregar otra alerta con distintos criterios?",
                    reply_markup=InlineKeyboardMarkup([[
@@ -2106,6 +2142,21 @@ async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: 
                    ]]))
     except Exception as e:
         log.exception("Envío inicial para %s: %s", chat_id, e)
+
+async def handle_ver_todos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Botón '📋 Ver todos': manda el resto de los resultados en mensajes de a 5."""
+    query   = update.callback_query
+    chat_id = str(query.message.chat_id)
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    more = _load_more(); entry = more.pop(chat_id, None); _save_more(more)
+    if not entry or not entry.get("items"):
+        await ctx.bot.send_message(query.message.chat_id, "Ya no tengo esos resultados guardados. Te aviso de los nuevos que aparezcan.")
+        return
+    async def job():
+        await _send_pages(ctx.application, chat_id, entry["items"], entry["sent"], entry["total"])
+        await ctx.bot.send_message(query.message.chat_id, f"✅ Listo, esos eran los {entry['total']}.")
+    task = asyncio.create_task(job()); _bg_tasks.add(task); task.add_done_callback(_bg_tasks.discard)
 
 async def handle_initial_send_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Elegí una de las dos opciones de arriba 👆")
@@ -2193,8 +2244,9 @@ async def _polite_wait(site: str):
 
 SOURCE_NAMES   = {"zonaprop": "ZonaProp", "argenprop": "ArgenProp", "mercadolibre": "MercadoLibre", "remax": "Remax"}
 failed_sources: dict = {}   # chat_id -> sitios que no respondieron en su última revisión
-skipped_sends: dict = {}    # chat_id -> publicaciones no mandadas por el tope del envío inicial
-INITIAL_MAX_SEND = 20
+INITIAL_CARDS   = 15      # hasta 15 resultados: tarjetas individuales
+PAGE_SIZE       = 5       # más de 15: mensajes de a 5
+MORE_FILE       = DATA_DIR / "pending_more.json"   # resultados pendientes de "Ver todos"
 
 def _failed_note(chat_id: str) -> str:
     f = sorted(failed_sources.get(chat_id, ()))
@@ -2205,7 +2257,7 @@ def _failed_note(chat_id: str) -> str:
             "(suelen bloquear un rato). Los vuelvo a probar solo y, apenas respondan, te aviso si aparece algo.")
 
 async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: str | None = None,
-                      silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS, max_send: int | None = None) -> int:
+                      silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS, collect: list | None = None) -> int:
     """Scrape the user's alerts (or only `only_alert`, by _id). Returns how many
     new listings were sent. With silent=True nothing is sent: every listing
     currently published is marked as seen, so only future ones are notified."""
@@ -2213,12 +2265,11 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
     total = 0
     loop  = asyncio.get_event_loop()
     failed_sources.pop(chat_id, None)
-    skipped_sends.pop(chat_id, None)
-    overflow: list = []
 
     for alert in get_alerts(user):
         if only_alert and alert.get("_id") != only_alert:
             continue
+        alert_silent = silent or bool(alert.get("_silent_first"))
         # Si el usuario la borró (o pausó todo) mientras corría la revisión, no seguir.
         current = load_users().get(chat_id, {})
         if alert.get("_id") and alert["_id"] not in {a.get("_id") for a in get_alerts(current)}:
@@ -2265,7 +2316,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
                     failed_sources.setdefault(chat_id, set()).add(SOURCE_NAMES[scraper_name])
                 elif _cycle_cache is not None:
                     _cycle_cache[key] = [dict(l) for l in listings]
-            if silent:
+            if alert_silent:
                 seen.update(l["id"] for l in listings)
                 continue
 
@@ -2291,11 +2342,11 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             listings = filter_listings(listings, alert, max_age)
             new = [l for l in listings if l["id"] not in seen]
 
+            if collect is not None:      # envío inicial: lo presenta _initial_send_job
+                collect.extend(new)
+                seen.update(l["id"] for l in new)
+                continue
             for l in new:
-                if max_send is not None and total + len(overflow) >= max_send:
-                    overflow.append(l)           # pasado el tope: va en las listas compactas
-                    seen.add(l["id"])
-                    continue
                 try:
                     await app.bot.send_message(
                         chat_id=int(chat_id),
@@ -2310,20 +2361,15 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
                 except Exception as e:
                     log.error("Error sending to %s: %s", chat_id, e)
 
-    # Lo que pasó el tope del envío inicial: todo igual, pero de a 10 por mensaje.
-    for i in range(0, len(overflow), 10):
-        chunk = overflow[i:i + 10]
-        text  = (f"📋 Más publicaciones ({i + 1}-{i + len(chunk)} de {len(overflow)}):\n\n"
-                 + "\n\n".join(_compact_listing(l) for l in chunk))
-        try:
-            await app.bot.send_message(int(chat_id), text, parse_mode="HTML", disable_web_page_preview=True)
-            await asyncio.sleep(0.6)
-        except Exception as e:
-            log.error("Error sending list to %s: %s", chat_id, e)
-    if overflow:
-        skipped_sends[chat_id] = len(overflow)
-        log.info("Enviado a %s | %d publicaciones más en %d listas", chat_id[-4:], len(overflow), (len(overflow) + 9) // 10)
     user["seen"] = sorted(seen)
+    # Alertas "solo las nuevas" cargadas a mano: la primera pasada ya marcó todo como visto.
+    done = [a.get("_id") for a in get_alerts(user) if a.get("_silent_first") and (not only_alert or a.get("_id") == only_alert)]
+    if done:
+        users_now = load_users()
+        for a in get_alerts(users_now.get(chat_id, {})):
+            if a.get("_id") in done:
+                a.pop("_silent_first", None)
+        save_users(users_now)
     return total
 
 async def scrape_all(app: Application):
@@ -2540,6 +2586,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reject_command_like), group=-1)
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_alert_del_button, pattern=r"^alert_del:[\w]+$"))
+    app.add_handler(CallbackQueryHandler(handle_ver_todos, pattern="^ver_todos$"))
     app.add_handler(CommandHandler("stop",       cmd_stop))
     app.add_handler(CommandHandler("estado",     cmd_estado))
     app.add_handler(CommandHandler("alertas",    cmd_alertas))
