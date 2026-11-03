@@ -128,16 +128,56 @@ def _days_ago(text: str) -> int | None:
         return n * 365
     return None
 
-def _listing(uid, address, price, expenses, features, link, days_ago=None) -> dict:
+def _listing(uid, address, price, expenses, features, link, days_ago=None, expenses_note="") -> dict:
     return {
         "id": uid,
         "address": address or "Sin dirección",
         "price": price,
         "expenses": expenses,
+        "expenses_note": expenses_note,
         "features": features,
         "link": link,
         "days_ago": days_ago,
     }
+
+# ── Expensas: monto real o lo que diga la publicación ──────────────────────────
+EXP_NONE     = "sin expensas"
+EXP_INCLUDED = "expensas incluidas"
+
+_EXP_NONE_RE = re.compile(
+    r"\bsin\s+expensas|\bno\s+(?:paga|tiene|abona|posee)\s+expensas|"   # sin \b final: "Sin expensasServicios"
+    r"\bexpensas\s*[:\-]?\s*(?:no\s+(?:paga|tiene|abona|posee)\b|cero\b|\$?\s*0(?![\d.,]))",
+    re.IGNORECASE)
+_EXP_INCLUDED_RE = re.compile(
+    r"\b(?:incluye|incluyen|incluido|incluida|incluidas|incluidos)\s+(?:las\s+)?expensas\b|"
+    r"\bexpensas\s+incluidas\b",
+    re.IGNORECASE)
+# "Expensas $132. 000 aprox", "expensas: $ 60.000", "$ 60.000 de expensas"
+_EXP_AMOUNT_RE = re.compile(
+    r"\bexpensas\s*(?:de|:|aprox\.?|aproximadas)?\s*\$\s*(\d[\d.\s]{2,10}\d)|"
+    r"\$\s*(\d[\d.\s]{2,10}\d)\s*(?:de\s+)?expensas\b|"
+    r"\bexpensas\s*[:=]?\s*(?:de\s+)?(\d{1,3}(?:\.\d{3})+)\b",   # "Expensas: 45.000" (sin $)
+    re.IGNORECASE)
+
+def _expenses_info(structured: str, text: str = "") -> tuple[str, str]:
+    """(expensas, nota). `expensas` es el monto ("$ 60.000") o "" si no hay monto;
+    `nota` es EXP_NONE / EXP_INCLUDED / "" (no informadas).
+    Prioridad: monto del campo estructurado > monto en el texto > "sin expensas" /
+    "incluidas" en el texto > campo estructurado en 0 > no informadas."""
+    amount = _parse_price(structured) if structured else 0
+    if amount >= 1000:
+        return f"$ {amount:,}".replace(",", "."), ""
+    for m in _EXP_AMOUNT_RE.finditer(text or ""):
+        val = int(re.sub(r"\D", "", next(g for g in m.groups() if g)) or 0)
+        if 1000 <= val <= 3_000_000:
+            return f"$ {val:,}".replace(",", "."), ""
+    if _EXP_NONE_RE.search(text or ""):
+        return "", EXP_NONE
+    if _EXP_INCLUDED_RE.search(text or ""):
+        return "", EXP_INCLUDED
+    if structured and re.search(r"\d", structured) and amount < 1000:
+        return "", EXP_NONE      # el anunciante cargó 0 (o $1) de expensas
+    return "", ""
 
 # Cloudflare on Fly IPs rejects some profiles intermittently; sessions keep the clearance cookies once one passes.
 _IMPERSONATE = ("chrome131", "chrome124")  # max 2 tries per cycle: bursts are what trigger blocks
@@ -175,7 +215,7 @@ def scrape_zonaprop(url: str) -> list[dict]:
         hood     = _text(card, "[class*='location-text']").split(",")[0].strip()
         address  = f"{street}, {hood}" if hood else street
         price    = _text(card, "h2[class*='postingPrices-module__price']")
-        expenses = _text(card, "[class*='expenses']")
+        expenses, exp_note = _expenses_info(_text(card, "[class*='expenses']"), card.get_text(" ", strip=True))
         features = _text(card, "[class*='posting-main-features-block']", sep=" · ")
         pub_text = _text(card, "[class*='antiquity-date'], [class*='Antiquity'], [class*='posting-date']")
         link_el  = card.select_one("a[href*='propiedades']")
@@ -184,7 +224,7 @@ def scrape_zonaprop(url: str) -> list[dict]:
             link = f"https://www.zonaprop.com.ar{path}" if path.startswith("/") else path
         else:
             link = f"https://www.zonaprop.com.ar/propiedades/clasificado/{listing_id}.html"
-        results.append(_listing(f"zp_{listing_id}", address, price, expenses, features, link, _days_ago(pub_text)))
+        results.append(_listing(f"zp_{listing_id}", address, price, expenses, features, link, _days_ago(pub_text), exp_note))
     log.info("[ZonaProp] %d listings", len(results))
     return results
 
@@ -300,7 +340,10 @@ def scrape_remax(alert: dict, params: dict) -> list[dict]:
         if (l.get("currency") or {}).get("value") == "USD":
             usd_note = f" · 💵 publicado en USD {price:,} (oficial ${rate:,})".replace(",", ".")
             price *= rate
-        exp = l.get("expensesPrice") or 0
+        exp, exp_note = _expenses_info(
+            str(l.get("expensesPrice")) if l.get("expensesPrice") else "",
+            f"{l.get('title', '')} {l.get('description', '')}",
+        )
         m2  = l.get("dimensionCovered") or l.get("dimensionTotalBuilt")
         features = f"{rooms} amb." + (f" · {round(m2)} m² cubiertos" if m2 else "") + f" · {l.get('title', '')}{usd_note}"
         type_id = (l.get("type") or {}).get("id", 0)
@@ -308,9 +351,10 @@ def scrape_remax(alert: dict, params: dict) -> list[dict]:
             f"rx_{l['id']}",
             f"{l.get('displayAddress', '')}, {l.get('geoLabel', '').split(',')[0]}",
             f"$ {int(price):,}".replace(",", "."),
-            f"$ {int(exp):,}".replace(",", ".") if exp else "",
+            exp,
             features,
             f"https://www.remax.com.ar/listings/{l.get('slug', l['id'])}",
+            expenses_note=exp_note,
         ), "tipo": "PH" if type_id == 12 else "Casa" if type_id in (9, 10, 11) else "Depto"})
     log.info("[Remax] %d raw, %d in barrios", len(raw), len(results))
     return results
@@ -374,29 +418,31 @@ def _parse_argenprop_cards(cards) -> list[dict]:
             for li in card.select(".card__main-features li, .card__details li, .listing__details li")
             if li.get_text(strip=True)
         )
-        exp_amount = _parse_price(expenses)
-        expenses = f"$ {exp_amount:,}".replace(",", ".") if exp_amount else ""
+        expenses, exp_note = _expenses_info(expenses, card.get_text(" ", strip=True))
         title = _text(card, ".card__title")
         if title:
             features = f"{features} · {title}" if features else title
         if not price:
             continue
         pub_text = _text(card, "[class*='date'], [class*='time'], [class*='fecha'], [class*='publicad']")
-        results.append(_listing(f"ap_{uid}", address, price, expenses, features, href, _days_ago(pub_text)))
+        results.append(_listing(f"ap_{uid}", address, price, expenses, features, href, _days_ago(pub_text), exp_note))
     return results
 
-def fetch_ml_expenses(url: str) -> str:
+def fetch_ml_expenses(url: str) -> tuple[str, str] | None:
+    """(expensas, nota) leídas de la publicación de ML (tabla + descripción).
+    None si no se pudo abrir la página."""
     soup = fetch(url, "https://inmuebles.mercadolibre.com.ar/")
     if not soup:
-        return ""
+        return None
+    table_val = ""
     for row in soup.select("tr"):
         header = row.select_one("th")
         value  = row.select_one("td")
         if header and value and "expensa" in header.get_text(strip=True).lower():
-            val = _clean(value.get_text(strip=True))
-            if val and val not in ("0 ARS", "0"):
-                return val
-    return ""
+            table_val = _clean(value.get_text(strip=True))
+            break
+    desc = soup.select_one("p.ui-pdp-description__content")
+    return _expenses_info(table_val, desc.get_text(" ", strip=True) if desc else "")
 
 _RESERVED = re.compile(r'\breservad[oa]\b', re.IGNORECASE)
 
@@ -542,6 +588,8 @@ def format_listing(l: dict) -> str:
     price_line = l["price"]
     if l["expenses"]:
         price_line += f" + {l['expenses']} expensas = ${total:,.0f} total".replace(",", ".")
+    elif l.get("expenses_note"):
+        price_line += f" ({l['expenses_note']})"
     else:
         price_line += " (expensas: no informadas)"
     tipo = l.get("tipo", "")
@@ -1501,11 +1549,14 @@ async def scrape_user(app: Application, chat_id: str, user: dict) -> int:
                 listings = scrape_mercadolibre(url)
 
             if scraper_name == "mercadolibre":
+                # Solo publicaciones nuevas: las ya enviadas no hace falta reabrirlas.
                 for l in listings:
-                    if not l["expenses"]:
-                        l["expenses"] = await loop.run_in_executor(
+                    if not l["expenses"] and l["id"] not in seen:
+                        info = await loop.run_in_executor(
                             None, lambda link=l["link"]: fetch_ml_expenses(link)
                         )
+                        if info:
+                            l["expenses"], l["expenses_note"] = info
 
             for l in listings:
                 l.setdefault("tipo", _infer_tipo(l["link"], url or ""))
