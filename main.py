@@ -2319,6 +2319,9 @@ _BACKOFF_MIN    = (15, 30, 60, 120, 180)
 _REQ_GAP        = (3.0, 7.0)          # segundos al azar entre pedidos al mismo sitio
 _last_request: dict = {}              # sitio -> time.time() del último pedido
 _cycle_cache: dict | None = None      # (sitio, url) -> listings, solo durante una vuelta
+# Sitios que bloquean seguido: en las vueltas automáticas se consultan con menos frecuencia.
+SITE_MIN_INTERVAL = {"argenprop": 60 * 60}   # segundos
+_skip_this_cycle: set = set()
 
 def _site_state() -> dict:
     try:
@@ -2411,6 +2414,8 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
         for scraper_name, url in sources:
             _fetch_failures.clear()
             key = (scraper_name, url or repr(remax_params(alert, user)) if scraper_name == "remax" else url)
+            if _cycle_cache is not None and scraper_name in _skip_this_cycle:
+                continue                                              # le toca en una vuelta posterior
             if _cycle_cache is not None and key in _cycle_cache:     # misma búsqueda ya hecha en esta vuelta
                 listings = [dict(l) for l in _cycle_cache[key]]
             elif _site_paused(scraper_name):
@@ -2506,6 +2511,21 @@ async def scrape_all(app: Application):
     if not users:
         return
     _cycle_cache = {}
+    # ¿A qué sitios lentos les toca esta vuelta?
+    st, now = _site_state(), time.time()
+    _skip_this_cycle.clear()
+    for site, every in SITE_MIN_INTERVAL.items():
+        if now - st.get(f"_last_{site}", 0) < every:
+            _skip_this_cycle.add(site)
+        else:
+            st[f"_last_{site}"] = now
+    try:
+        tmp = SITE_STATE_FILE.with_suffix(".tmp"); tmp.write_text(json.dumps(st)); os.replace(tmp, SITE_STATE_FILE)
+    except OSError:
+        pass
+    if _skip_this_cycle:
+        log.info("Vuelta sin %s (se consulta cada %d min)", ", ".join(sorted(_skip_this_cycle)),
+                 min(SITE_MIN_INTERVAL[x] for x in _skip_this_cycle) // 60)
     try:
         await _scrape_all_users(app, users)
     finally:
