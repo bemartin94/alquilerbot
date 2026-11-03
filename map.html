@@ -77,12 +77,22 @@ function updateUI() {
   document.getElementById('btn').disabled = n === 0;
 }
 
+// Barrios ya elegidos (al editar una alerta): ?sel=Palermo|Villa Urquiza
+const norm = s => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+const preselected = new Set((new URLSearchParams(location.search).get('sel') || '')
+  .split('|').filter(Boolean).map(norm));
+
 function addLayer(data, defaultStyle, selectedStyle) {
   L.geoJSON(data, {
     style: defaultStyle,
     onEachFeature(feature, layer) {
       const name = feature.properties.nombre;
       layerMap[name] = { layer, defaultStyle, selectedStyle };
+      if (preselected.has(norm(name))) {
+        selected.add(name);
+        layer.setStyle(selectedStyle);
+        updateUI();
+      }
       layer.bindTooltip(name, { permanent: false, direction: 'center' });
       layer.on('click', () => {
         if (selected.has(name)) {

@@ -17,6 +17,7 @@ import re
 import time
 import unicodedata
 import uuid
+from urllib.parse import quote
 from pathlib import Path
 
 import aiohttp
@@ -1369,6 +1370,27 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data not in field_prompts:
         return ConversationHandler.END
 
+    if data == "ef_zona" and WEB_APP_URL:
+        alert = alerts[idx]
+        users[chat_id]["_edit_zone_alert"] = alert.get("_id") or str(idx + 1)
+        save_users(users)
+        actuales = alert.get("barrios") or []
+        name = alert.get("name") or alert.get("summary", f"Alerta {idx+1}")
+        await query.edit_message_text(
+            f"✏️ Editando alerta {idx+1}: <b>{html_mod.escape(name)}</b> → Zona", parse_mode="HTML")
+        await ctx.bot.send_message(
+            query.message.chat_id,
+            "Te abro el mapa para elegir los barrios de esta alerta 👇\n"
+            + (f"Ya están marcados los actuales: <b>{html_mod.escape(', '.join(actuales))}</b>.\n" if actuales else "")
+            + "Tocá para agregar o sacar barrios y después <b>Confirmar</b>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🗺️ Elegir barrios",
+                web_app=WebAppInfo(url=f"{WEB_APP_URL}/map?sel={quote('|'.join(actuales))}"),
+            )]]),
+        )
+        return ConversationHandler.END
+
     field, prompt = field_prompts[data]
     ctx.user_data["edit_field"] = field
     labels = {"ef_m2": "Metros mínimos", "ef_precio": "Presupuesto", "ef_extras": "Extras",
@@ -2032,6 +2054,49 @@ async def _http_conurbano(request):
 
 _BOT_APP = None  # set in main() before HTTP server starts
 
+_bg_tasks: set = set()
+
+async def _apply_zone_edit(chat_id: str, aid: str, barrios: list):
+    """Cambia los barrios de una alerta elegidos en el mapa. Groq solo rearma las
+    URLs de búsqueda; precio, m², tipo, ambientes y dueño directo quedan igual."""
+    send = lambda text: _BOT_APP.bot.send_message(int(chat_id), text, parse_mode="HTML")
+    lista = ", ".join(barrios)
+    try:
+        users  = load_users()
+        alerts = get_alerts(users.get(chat_id, {}))
+        idx    = _find_alert_idx(alerts, aid)
+        if idx is None or idx < 0:
+            await send("⚠️ Esa alerta ya no existe. Usá /alertas para ver las actuales.")
+            return
+        old = alerts[idx]
+        await send(f"Perfecto, actualizo los barrios a <b>{html_mod.escape(lista)}</b>...")
+        desc = (f"Misma búsqueda pero SOLO en estos barrios/localidades: {lista}. "
+                f"Búsqueda: {old.get('summary', '')}")
+        result = await interpret_search(desc, correction=True)
+        if not result or result.get("no_es_busqueda"):
+            log.error("Edición de zona falló para %s: %r", aid, result)
+            await send("No pude actualizar los barrios. Probá de nuevo desde /alertas → Editar → Zona.")
+            return
+        users  = load_users()   # recargar: pudo cambiar mientras respondía Groq
+        alerts = get_alerts(users.get(chat_id, {}))
+        idx    = _find_alert_idx(alerts, aid)
+        if idx is None or idx < 0:
+            return
+        alert = alerts[idx]
+        for k in ("zonaprop_urls", "argenprop_urls", "mercadolibre_urls", "name", "summary"):
+            if result.get(k):
+                alert[k] = result[k]
+        alert["barrios"] = barrios
+        if alert.get("min_m2"):
+            _refresh_alert_text(alert, "min_m2")
+        if _price_limits(alert)[1]:
+            _refresh_alert_text(alert, "max_total_price")
+        save_users(users)
+        await send(f"✅ Barrios actualizados: <b>{html_mod.escape(lista)}</b>\n{_alert_params_line(alert)}")
+    except Exception as e:
+        log.exception("Edición de zona: %s", e)
+        await send("No pude actualizar los barrios. Probá de nuevo desde /alertas → Editar → Zona.")
+
 async def _http_submit_zones(request):
     """Receive zone selection from the map mini app (POST /submit-zones)."""
     try:
@@ -2047,6 +2112,12 @@ async def _http_submit_zones(request):
     chat_id_str = str(chat_id)
     users = load_users()
     users.setdefault(chat_id_str, {"active": True, "seen": [], "alerts": []})
+    edit_aid = users[chat_id_str].pop("_edit_zone_alert", None)
+    if edit_aid:
+        save_users(users)
+        task = asyncio.create_task(_apply_zone_edit(chat_id_str, edit_aid, barrios))
+        _bg_tasks.add(task); task.add_done_callback(_bg_tasks.discard)
+        return aiohttp_web.Response(text="ok")
     users[chat_id_str]["zones"] = barrios
     save_users(users)
 
