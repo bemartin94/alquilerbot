@@ -985,8 +985,9 @@ async def handle_alert_edit_button(update: Update, ctx: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
     ctx.user_data["editing_idx"] = idx
+    # Mensaje nuevo al final del chat: la tarjeta de la alerta en la lista queda igual.
     await _show_edit_menu(
-        lambda text, **kw: query.edit_message_text(text, **kw),
+        lambda text, **kw: ctx.bot.send_message(query.message.chat_id, text, **kw),
         alerts[idx], idx,
     )
     return AWAITING_EDIT_CHOICE
@@ -1192,7 +1193,15 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     field, prompt = field_prompts[data]
     ctx.user_data["edit_field"] = field
-    await query.edit_message_text(prompt, parse_mode="HTML")
+    labels = {"ef_m2": "Metros mínimos", "ef_precio": "Presupuesto", "ef_extras": "Extras",
+              "ef_tipo": "Tipo de propiedad", "ef_ambientes": "Ambientes", "ef_zona": "Zona"}
+    name = alerts[idx].get("name") or alerts[idx].get("summary", f"Alerta {idx+1}")
+    # El menú queda como resumen (sin botones) y la pregunta va al final del chat.
+    await query.edit_message_text(
+        f"✏️ Editando alerta {idx+1}: <b>{html_mod.escape(name)}</b> → {labels.get(data, '')}",
+        parse_mode="HTML",
+    )
+    await ctx.bot.send_message(query.message.chat_id, prompt, parse_mode="HTML")
     return AWAITING_EDIT_FIELD
 
 async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
