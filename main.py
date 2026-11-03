@@ -2018,7 +2018,13 @@ async def handle_initial_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send(f"Te mandé {count} publicación(es) de la última semana. "
                    "Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo.")
     await send("💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento.")
-    await send("¿Querés agregar otra alerta con distintos criterios? (si/no)")
+    await ctx.bot.send_message(
+        query.message.chat_id, "¿Querés agregar otra alerta con distintos criterios?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("➕ Sí, otra alerta", callback_data="more_si"),
+            InlineKeyboardButton("👍 No, listo",       callback_data="more_no"),
+        ]]),
+    )
     return AWAITING_MORE_ALERTS
 
 async def handle_initial_send_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2026,15 +2032,22 @@ async def handle_initial_send_text(update: Update, ctx: ContextTypes.DEFAULT_TYP
     return AWAITING_INITIAL_SEND
 
 async def handle_more_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text    = update.message.text.lower().strip()
+    """Botones ➕ Sí, otra alerta / 👍 No, listo (o escribiendo si / no)."""
     chat_id = str(update.effective_chat.id)
+    query   = update.callback_query
+    if query:
+        await query.answer()
+        await query.edit_message_reply_markup(reply_markup=None)
+        yes, msg = query.data == "more_si", query.message
+    else:
+        yes, msg = update.message.text.lower().strip() in ("si", "sí", "yes", "s", "dale"), update.message
 
-    if text in ("si", "sí", "yes", "s"):
-        return await _start_wizard(update.message, ctx)
+    if yes:
+        return await _start_wizard(msg, ctx)
 
     users  = load_users()
     n      = len(get_alerts(users.get(chat_id, {})))
-    await update.message.reply_text(
+    await msg.reply_text(
         f"Listo! Tenés {n} alerta(s) configurada(s). Te aviso cuando aparezcan publicaciones.\n"
         "Usá /alertas para ver o borrar alertas, /buscar para agregar más, /stop para pausar.",
     )
@@ -2299,6 +2312,7 @@ def main():
             ],
             AWAITING_MORE_ALERTS:  [
                 MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data),
+                CallbackQueryHandler(handle_more_alerts, pattern="^more_(si|no)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_more_alerts),
             ],
             AWAITING_EDIT_CHOICE:  [edit_choice],
