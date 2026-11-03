@@ -118,9 +118,21 @@ def load_users() -> dict:
     return {}
 
 def save_users(users: dict):
-    USERS_FILE.write_text(
-        json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    # Escritura atómica: si el proceso muere a mitad de camino, users.json no queda roto.
+    tmp = USERS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, USERS_FILE)
+
+def _merge_seen(chat_id: str, seen) -> None:
+    """Guarda solo las publicaciones vistas, sobre una copia RECIÉN leída.
+    Un scrape tarda minutos: guardar la copia leída al empezar borraba lo que el
+    usuario hizo mientras tanto (alertas nuevas, ediciones)."""
+    users = load_users()
+    user  = users.get(chat_id)
+    if user is None:
+        return
+    user["seen"] = sorted(set(user.get("seen", [])) | set(seen or []))
+    save_users(users)
 
 # ── Scraping helpers ───────────────────────────────────────────────────────────
 def _clean(text: str) -> str:
@@ -2012,7 +2024,7 @@ async def handle_initial_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user  = users.get(chat_id, {})
     count = await scrape_user(ctx.application, chat_id, user, only_alert=aid,
                               silent=only_new, max_age=INITIAL_SEND_DAYS)
-    save_users(users)
+    _merge_seen(chat_id, user.get("seen", []))
     release_memory()
     note = _failed_note(chat_id)
     if only_new:
@@ -2154,14 +2166,11 @@ async def scrape_all(app: Application):
     users = load_users()
     if not users:
         return
-    changed = False
     for chat_id, user in users.items():
         if not user.get("active", True):
             continue
         await scrape_user(app, chat_id, user)
-        changed = True
-    if changed:
-        save_users(users)
+        _merge_seen(chat_id, user.get("seen", []))
     release_memory()
     log.info("Scrape cycle done for %d user(s)", len(users))
 
