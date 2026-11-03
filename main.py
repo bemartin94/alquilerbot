@@ -1863,7 +1863,8 @@ async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, res
     if result.get("solo_dueno"):
         msg += "👤 Solo dueño directo\n"
     msg += "\n¿Confirmás?"
-    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=_confirm_kb())
+    await update.message.reply_text(msg, parse_mode="HTML",
+                                    reply_markup=_confirm_kb(search=result.get("_editing_idx") is None))
     return AWAITING_CONFIRMATION
 
 # ── Entry point: routes to wizard or free-text ────────────────────────────────
@@ -2001,11 +2002,44 @@ def _keep_uncorrected(result: dict, prev: dict, correction: str, total_default: 
         result["min_m2"] = prev["min_m2"]
         _refresh_alert_text(result, "min_m2")
 
-def _confirm_kb() -> InlineKeyboardMarkup:
+def _confirm_kb(search: bool = False) -> InlineKeyboardMarkup:
+    if search:   # búsqueda nueva: también se puede buscar una vez sin guardar la alerta
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Guardar alerta",     callback_data="confirm_si"),
+             InlineKeyboardButton("🔍 Solo buscar ahora", callback_data="confirm_buscar")],
+            [InlineKeyboardButton("✏️ Corregir",          callback_data="confirm_no")],
+        ])
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Sí, guardar",  callback_data="confirm_si"),
         InlineKeyboardButton("✏️ No, corregir", callback_data="confirm_no"),
     ]])
+
+async def _oneoff_search(app: Application, chat_id: str, search: dict):
+    """Busca una vez con estos filtros, sin crear alerta."""
+    send = lambda text, **kw: app.bot.send_message(int(chat_id), text, **kw)
+    try:
+        alert = {k: v for k, v in search.items() if not k.startswith("_editing")}
+        alert["_id"] = "oneoff"
+        tmp_user = {"alerts": [alert], "seen": [], "active": True}
+        found: list = []
+        await scrape_user(app, chat_id, tmp_user, only_alert="oneoff", collect=found, check_exists=False)
+        release_memory()
+        note = _failed_note(chat_id)
+        log.info("Búsqueda puntual para %s: %d encontradas", chat_id[-4:], len(found))
+        if found:
+            await present_listings(app, chat_id, found, " (búsqueda puntual)")
+            text = f"✅ Esas son las {len(found)} publicaciones de los últimos {MAX_LISTING_AGE_DAYS} días."
+        else:
+            text = f"No encontré publicaciones de los últimos {MAX_LISTING_AGE_DAYS} días con esos filtros"
+            text += " en los sitios que respondieron." if note else "."
+        await send(text + note + "\n\n¿Querés guardar esta búsqueda como alerta para que te avise de las nuevas?",
+                   reply_markup=InlineKeyboardMarkup([[
+                       InlineKeyboardButton("💾 Guardarla como alerta", callback_data="confirm_si"),
+                       InlineKeyboardButton("👍 Listo",                 callback_data="oneoff_done"),
+                   ]]))
+    except Exception as e:
+        log.exception("Búsqueda puntual para %s: %s", chat_id, e)
+        await send("No pude terminar la búsqueda. Probá de nuevo con /buscar.")
 
 async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Confirmación con botones (o escribiendo si / no)."""
@@ -2013,8 +2047,21 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     if query:
         await query.answer()
-        text = "si" if query.data == "confirm_si" else "no"
         await query.edit_message_reply_markup(reply_markup=None)   # sin botones viejos
+        if query.data == "confirm_buscar":
+            if not ctx.user_data.get("pending"):
+                return ConversationHandler.END
+            await ctx.bot.send_message(query.message.chat_id,
+                "🔍 Buscando con esos filtros, sin crear alerta... Puede tardar un par de minutos.")
+            task = asyncio.create_task(_oneoff_search(ctx.application, chat_id, dict(ctx.user_data["pending"])))
+            _bg_tasks.add(task); task.add_done_callback(_bg_tasks.discard)
+            return AWAITING_CONFIRMATION          # después puede tocar "Guardarla como alerta"
+        if query.data == "oneoff_done":
+            ctx.user_data.pop("pending", None)
+            await ctx.bot.send_message(query.message.chat_id,
+                "👍 Listo, no guardé ninguna alerta. Cuando quieras, /buscar para otra búsqueda.")
+            return ConversationHandler.END
+        text = "si" if query.data == "confirm_si" else "no"
         reply = lambda t, **kw: ctx.bot.send_message(query.message.chat_id, t, **kw)
     else:
         text  = update.message.text.lower().strip()
@@ -2385,7 +2432,8 @@ def _failed_note(chat_id: str) -> str:
             "(suelen bloquear un rato). Los vuelvo a probar solo y, apenas respondan, te aviso si aparece algo.")
 
 async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: str | None = None,
-                      silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS, collect: list | None = None) -> int:
+                      silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS, collect: list | None = None,
+                      check_exists: bool = True) -> int:
     """Scrape the user's alerts (or only `only_alert`, by _id). Returns how many
     new listings were sent. With silent=True nothing is sent: every listing
     currently published is marked as seen, so only future ones are notified."""
@@ -2400,7 +2448,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
         alert_silent = silent or bool(alert.get("_silent_first"))
         # Si el usuario la borró (o pausó todo) mientras corría la revisión, no seguir.
         current = load_users().get(chat_id, {})
-        if alert.get("_id") and alert["_id"] not in {a.get("_id") for a in get_alerts(current)}:
+        if check_exists and alert.get("_id") and alert["_id"] not in {a.get("_id") for a in get_alerts(current)}:
             log.info("Alerta %s borrada durante la revisión, la salteo", alert.get("_id"))
             continue
         if not only_alert and not current.get("active", True):
@@ -2723,7 +2771,7 @@ def main():
             ],
             AWAITING_EXTRAS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_extras)],
             AWAITING_CONFIRMATION: [
-                CallbackQueryHandler(handle_confirmation, pattern="^confirm_(si|no)$"),
+                CallbackQueryHandler(handle_confirmation, pattern="^(confirm_(si|no|buscar)|oneoff_done)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirmation),
             ],
             AWAITING_INITIAL_SEND: [
