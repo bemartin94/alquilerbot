@@ -497,6 +497,10 @@ def _apply_price_cap(url: str, alert: dict) -> str:
     url = re.sub(r"(--precio-desde-\d+-hasta-)\d+", rf"\g<1>{cap}", url)          # ArgenProp
     return url
 
+# Un depto casi siempre tiene expensas: si no están informadas y el alquiler solo
+# ya supera este % del presupuesto total, no entra. Casas y PH se muestran igual.
+DEPTO_UNKNOWN_EXP_MAX_SHARE = 0.90
+
 def filter_listings(listings: list, alert: dict) -> list:
     min_p    = alert.get("min_price", 200000)
     max_r, max_t = _price_limits(alert)
@@ -524,6 +528,9 @@ def filter_listings(listings: list, alert: dict) -> list:
 
         # Expensas reales; si la publicación no tiene, cuenta solo el alquiler.
         total = rent + _parse_price(l["expenses"])
+        if (max_t and l.get("tipo") == "Depto" and not l["expenses"]
+                and not l.get("expenses_note") and rent > max_t * DEPTO_UNKNOWN_EXP_MAX_SHARE):
+            continue  # depto en el límite con expensas no informadas
         if max_t and total > max_t:
             continue
         # Reject "reservado" anywhere in the listing text
