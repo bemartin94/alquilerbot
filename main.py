@@ -1292,6 +1292,16 @@ async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, res
 
 # ── Entry point: routes to wizard or free-text ────────────────────────────────
 
+class _MapWizardPending(filters.MessageFilter):
+    """Matches only when the map (/submit-zones) left this chat waiting for the
+    'ambientes' answer. Needed because the ConversationHandler has
+    allow_reentry=True, so entry points are checked BEFORE the current state's
+    handlers: a catch-all text entry point would swallow every wizard answer."""
+    def filter(self, message) -> bool:
+        return load_users().get(str(message.chat_id), {}).get("_wizard_step") == "ambientes"
+
+MAP_WIZARD_PENDING = _MapWizardPending()
+
 async def receive_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Plain text outside a flow. Only continues if /submit-zones (map) set a wizard
     step; otherwise the message is rejected with the command list."""
@@ -1588,7 +1598,9 @@ def main():
             CommandHandler("editar", cmd_editar),
             CallbackQueryHandler(handle_alert_edit_button, pattern=r"^alert_edit:[\w]+$"),
             MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_description),
+            # Solo para la respuesta de ambientes tras elegir barrios en el mapa.
+            # Cualquier otro texto fuera de un flujo cae en fallback_unknown.
+            MessageHandler(filters.TEXT & ~filters.COMMAND & MAP_WIZARD_PENDING, receive_description),
         ],
         states={
             AWAITING_ZONE_CONFIRM: [
