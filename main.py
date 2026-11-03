@@ -2293,7 +2293,7 @@ async def _polite_wait(site: str):
 
 SOURCE_NAMES   = {"zonaprop": "ZonaProp", "argenprop": "ArgenProp", "mercadolibre": "MercadoLibre", "remax": "Remax"}
 failed_sources: dict = {}   # chat_id -> sitios que no respondieron en su última revisión
-INITIAL_CARDS   = 15      # hasta 15 resultados: tarjetas individuales
+INITIAL_CARDS   = 5       # hasta 5 resultados: tarjetas individuales; desde 6, paginado
 PAGE_SIZE       = 5       # más de 15: mensajes de a 5
 MORE_FILE       = DATA_DIR / "pending_more.json"   # resultados pendientes de "Ver todos"
 
