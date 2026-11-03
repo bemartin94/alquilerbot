@@ -1639,7 +1639,8 @@ async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAUL
             result = await interpret_search(combined, correction=True)
         if result and not result.get("no_es_busqueda"):
             ctx.user_data["last_desc"] = combined
-            _keep_uncorrected(result, ctx.user_data.get("prev_result") or {}, desc)
+            _keep_uncorrected(result, ctx.user_data.get("prev_result") or {}, desc,
+                              ctx.user_data.get("wizard", {}).get("expensas_incluidas"))
             return await _show_confirmation(update, ctx, result)
         log.error("No se pudo aplicar la corrección %r (resultado: %r)", desc, result)
         ctx.user_data["correcting"] = True   # sigue la búsqueda anterior
@@ -1682,12 +1683,23 @@ _CORR_PRICE_RE = re.compile(
     r"\d+(?:[.,]\d+)?\s*(?:k|mil|m)\b|\d{3,}(?:\.\d{3})*(?!\s*(?:m2|m²|metro|mts))", re.IGNORECASE)
 _CORR_M2_RE    = re.compile(r"m2|m²|metro|mts|superficie", re.IGNORECASE)
 
-def _keep_uncorrected(result: dict, prev: dict, correction: str):
+_CORR_MODE_RE = re.compile(r"alquiler|expensa|total|todo\s+incluido", re.IGNORECASE)
+
+def _keep_uncorrected(result: dict, prev: dict, correction: str, total_default: bool | None = None):
     """Tras una corrección, lo que el usuario no mencionó queda como antes
-    (sin depender de que Groq lo respete): precio y m² mínimos."""
+    (sin depender de que Groq lo respete): precio, modo del precio y m² mínimos.
+    `total_default`: modo del wizard si la búsqueda anterior no tenía precio."""
     if not prev:
         return
-    if not _CORR_PRICE_RE.search(correction):
+    if _CORR_PRICE_RE.search(correction) and not _CORR_MODE_RE.search(correction):
+        # Cambió el monto pero no dijo si es total o de alquiler: se mantiene el modo.
+        prev_total = bool(_price_limits(prev)[1]) if _price_limits(prev)[0] else total_default
+        amount = max(result.get("max_total_price") or 0, result.get("max_rent_price") or 0)
+        if amount and prev_total is not None:
+            result["max_rent_price"] = amount
+            result["max_total_price"] = amount if prev_total else 0
+            result["_expensas_incluidas"] = prev_total
+    elif not _CORR_PRICE_RE.search(correction):
         for k in ("max_rent_price", "max_total_price", "min_price", "_expensas_incluidas"):
             if k in prev:
                 result[k] = prev[k]
