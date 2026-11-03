@@ -2087,6 +2087,63 @@ def _load_more() -> dict:
 def _save_more(d: dict):
     tmp = MORE_FILE.with_suffix(".tmp"); tmp.write_text(json.dumps(d, ensure_ascii=False)); os.replace(tmp, MORE_FILE)
 
+def _page_view(token: str, entry: dict, page: int):
+    items, pages = entry["items"], max(1, (len(entry["items"]) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page  = min(max(page, 1), pages)
+    chunk = items[(page - 1) * PAGE_SIZE: page * PAGE_SIZE]
+    text  = (f"📋 <b>{len(items)} publicaciones</b>{entry.get('title', '')} — página {page} de {pages}\n\n"
+             + "\n\n".join(_compact_listing(l) for l in chunk))
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"pg:{token}:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="pg_noop"))
+    if page < pages:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"pg:{token}:{page + 1}"))
+    return text, InlineKeyboardMarkup([nav])
+
+async def present_listings(app: Application, chat_id: str, listings: list, title: str = "") -> None:
+    """Hasta INITIAL_CARDS: tarjetas sueltas (con foto). Más: un solo mensaje paginado
+    (◀️ ▶️ editan el mismo mensaje)."""
+    for l in listings:
+        log.info("Enviado a %s | alerta %r | %s %s | %s", chat_id[-4:], l.get("_alert"), l.get("tipo", ""),
+                 l["id"], l.get("address", "")[:50])
+    if len(listings) <= INITIAL_CARDS:
+        for l in listings:
+            try:
+                await app.bot.send_message(int(chat_id), format_listing(l), parse_mode="HTML")
+            except Exception as e:
+                log.error("Error sending to %s: %s", chat_id, e)
+            await asyncio.sleep(0.4)
+        return
+    token = uuid.uuid4().hex[:8]
+    more  = _load_more()
+    mine  = [k for k in more if k.startswith(f"{chat_id}:")]
+    for k in mine[:-9]:                     # guardar como máximo 10 listas por chat
+        more.pop(k, None)
+    more[f"{chat_id}:{token}"] = {"items": listings, "title": title}
+    _save_more(more)
+    text, kb = _page_view(token, more[f"{chat_id}:{token}"], 1)
+    try:
+        await app.bot.send_message(int(chat_id), text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    except Exception as e:
+        log.error("Error sending page to %s: %s", chat_id, e)
+
+async def handle_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Botones ◀️ / ▶️ de un mensaje paginado."""
+    query = update.callback_query
+    if query.data == "pg_noop":
+        await query.answer()
+        return
+    _, token, page = query.data.split(":")
+    entry = _load_more().get(f"{query.message.chat_id}:{token}")
+    if not entry:
+        await query.answer("Esta lista ya no está disponible.", show_alert=False)
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+    await query.answer()
+    text, kb = _page_view(token, entry, int(page))
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
 async def _send_pages(app: Application, chat_id: str, listings: list, start_n: int, total_n: int):
     """Manda publicaciones en mensajes de a PAGE_SIZE."""
     for i in range(0, len(listings), PAGE_SIZE):
@@ -2116,23 +2173,10 @@ async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: 
             await send(("No encontré publicaciones de la última semana que coincidan"
                         + (" en los sitios que respondieron." if note else ".")
                         + " Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo.") + note)
-        elif n <= INITIAL_CARDS:
-            for l in found:
-                try:
-                    await send(format_listing(l), parse_mode="HTML")
-                except Exception as e:
-                    log.error("Error sending to %s: %s", chat_id, e)
-                await asyncio.sleep(0.4)
+        else:
+            await present_listings(app, chat_id, found, " de la última semana")
             await send(f"Te mandé {n} publicación(es) de la última semana. "
                        "Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo." + note)
-        else:
-            first = 3 * PAGE_SIZE
-            await _send_pages(app, chat_id, found[:first], 0, n)
-            more = _load_more(); more[chat_id] = {"items": found[first:], "total": n, "sent": first}; _save_more(more)
-            await send(f"🔎 Encontramos muchos resultados: <b>{n}</b>. Te mostré los primeros {first}.\n"
-                       "¿Querés verlos todos?" + note, parse_mode="HTML",
-                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                           f"📋 Ver todos ({n - first} más)", callback_data="ver_todos")]]))
         log.info("Envío inicial a %s: %d encontradas", chat_id[-4:], n)
         await send("💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento.")
         await send("¿Querés agregar otra alerta con distintos criterios?",
@@ -2342,7 +2386,9 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             listings = filter_listings(listings, alert, max_age)
             new = [l for l in listings if l["id"] not in seen]
 
-            if collect is not None:      # envío inicial: lo presenta _initial_send_job
+            if collect is not None:      # lo presenta present_listings al final de la pasada
+                for l in new:
+                    l["_alert"] = alert.get("name")
                 collect.extend(new)
                 seen.update(l["id"] for l in new)
                 continue
@@ -2387,8 +2433,17 @@ async def _scrape_all_users(app: Application, users: dict):
     for chat_id, user in users.items():
         if not user.get("active", True):
             continue
-        await scrape_user(app, chat_id, user)
+        found: list = []
+        await scrape_user(app, chat_id, user, collect=found)
         _merge_seen(chat_id, user.get("seen", []))
+        if found:
+            await present_listings(app, chat_id, found, " nuevas")
+            try:
+                await app.bot.send_message(int(chat_id),
+                    "✅ Esas son todas las novedades por ahora. Podés cambiar tus alertas en /alertas.")
+            except Exception as e:
+                log.error("Error sending to %s: %s", chat_id, e)
+            log.info("Vuelta: %d publicaciones nuevas a %s", len(found), chat_id[-4:])
     release_memory()
     log.info("Scrape cycle done for %d user(s)", len(users))
 
@@ -2586,7 +2641,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reject_command_like), group=-1)
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_alert_del_button, pattern=r"^alert_del:[\w]+$"))
-    app.add_handler(CallbackQueryHandler(handle_ver_todos, pattern="^ver_todos$"))
+    app.add_handler(CallbackQueryHandler(handle_ver_todos, pattern="^ver_todos$"))   # botones viejos
+    app.add_handler(CallbackQueryHandler(handle_page, pattern=r"^pg(:\w+:\d+|_noop)$"))
     app.add_handler(CommandHandler("stop",       cmd_stop))
     app.add_handler(CommandHandler("estado",     cmd_estado))
     app.add_handler(CommandHandler("alertas",    cmd_alertas))
