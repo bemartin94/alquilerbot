@@ -2128,6 +2128,7 @@ async def present_listings(app: Application, chat_id: str, listings: list, title
         for l in listings:
             try:
                 await app.bot.send_message(int(chat_id), format_listing(l), parse_mode="HTML")
+                _merge_seen(chat_id, [l["id"]])     # guardada como vista YA: un reinicio no la repite
             except Exception as e:
                 log.error("Error sending to %s: %s", chat_id, e)
             await asyncio.sleep(0.4)
@@ -2142,6 +2143,7 @@ async def present_listings(app: Application, chat_id: str, listings: list, title
     text, kb = _page_view(token, more[f"{chat_id}:{token}"], 1)
     try:
         await app.bot.send_message(int(chat_id), text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        _merge_seen(chat_id, [l["id"] for l in listings])
     except Exception as e:
         log.error("Error sending page to %s: %s", chat_id, e)
 
@@ -2479,6 +2481,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
                         parse_mode="HTML",
                     )
                     seen.add(l["id"])
+                    _merge_seen(chat_id, [l["id"]])
                     total += 1
                     log.info("Enviado a %s | alerta %r | %s %s | %s", chat_id[-4:], alert.get("name"),
                              l.get("tipo", ""), l["id"], l.get("address", "")[:50])
