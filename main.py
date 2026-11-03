@@ -1490,12 +1490,13 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if idx is None or idx < 0 or idx >= len(alerts):
             await query.edit_message_text("⚠️ Esa alerta ya no existe. Usá /alertas para ver las actuales.")
             return ConversationHandler.END
+        before = dict(alerts[idx])
         alerts[idx]["solo_dueno"] = not alerts[idx].get("solo_dueno")
         save_users(users)
         await query.edit_message_text(
             "👤 Ahora solo te mando publicaciones de <b>dueño directo</b>." if alerts[idx]["solo_dueno"]
             else "🤝 Ahora te mando publicaciones de <b>dueños e inmobiliarias</b>.", parse_mode="HTML")
-        await ask_resend(ctx.bot, chat_id, alerts[idx].get("_id"))
+        await ask_resend(ctx.bot, chat_id, alerts[idx].get("_id"), before, alerts[idx])
         return ConversationHandler.END
 
     if data == "ef_cancel":
@@ -1569,7 +1570,8 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Algo falló, intentá de nuevo con /editar.")
         return ConversationHandler.END
 
-    alert = alerts[idx]
+    alert  = alerts[idx]
+    before = json.loads(json.dumps(alert))   # para saber si la edición amplía la búsqueda
 
     # Simple numeric field: min_m2
     if field == "min_m2":
@@ -1581,7 +1583,7 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         _refresh_alert_text(alert, "min_m2")
         save_users(users)
         await update.message.reply_text(f"Metros mínimos actualizado a <b>{alert['min_m2']} m² totales</b>.", parse_mode="HTML")
-        await ask_resend(ctx.bot, chat_id, alert.get("_id"))
+        await ask_resend(ctx.bot, chat_id, alert.get("_id"), before, alert)
         return ConversationHandler.END
 
     # Price field: max_total_price
@@ -1611,7 +1613,7 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         _refresh_alert_text(alert, "max_total_price")
         save_users(users)
         await update.message.reply_text(f"Presupuesto máximo actualizado a <b>{_fmt_ars(val)}</b>.", parse_mode="HTML")
-        await ask_resend(ctx.bot, chat_id, alert.get("_id"))
+        await ask_resend(ctx.bot, chat_id, alert.get("_id"), before, alert)
         return ConversationHandler.END
 
     # Keywords field
@@ -1624,7 +1626,7 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         kws = alert["require_keywords"]
         msg = f"Palabras clave actualizadas: <b>{', '.join(kws)}</b>." if kws else "Palabras clave eliminadas."
         await update.message.reply_text(msg, parse_mode="HTML")
-        await ask_resend(ctx.bot, chat_id, alert.get("_id"))
+        await ask_resend(ctx.bot, chat_id, alert.get("_id"), before, alert)
         return ConversationHandler.END
 
     # NLP-based fields (tipo, ambientes, zona): regenerate URLs
@@ -2024,8 +2026,9 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if edit_idx is not None:
             users = load_users()
             user  = users.get(chat_id)
+            old = {}
             if user and "alerts" in user and edit_idx < len(user["alerts"]):
-                old = user["alerts"][edit_idx]
+                old = dict(user["alerts"][edit_idx])
                 alert["_id"] = old.get("_id") or uuid.uuid4().hex[:8]      # mismo id: no es otra alerta
                 alert.setdefault("solo_dueno", old.get("solo_dueno", False))
                 alert["_urls_v"] = 2
@@ -2035,7 +2038,7 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Alerta actualizada: <b>{alert.get('name') or alert.get('summary','')}</b>",
                 parse_mode="HTML"
             )
-            await ask_resend(ctx.bot, chat_id, alert.get("_id"))
+            await ask_resend(ctx.bot, chat_id, alert.get("_id"), old or None, alert)
             return ConversationHandler.END
         add_alert(chat_id, alert)
         ctx.user_data["initial_alert_id"] = alert.get("_id")
@@ -2211,9 +2214,36 @@ async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: 
     except Exception as e:
         log.exception("Envío inicial para %s: %s", chat_id, e)
 
-async def ask_resend(bot, chat_id, aid: str):
-    """Tras editar una alerta: ¿mostrar las de la última semana con el filtro nuevo?"""
-    if not aid:
+def _broadens(before: dict, after: dict) -> bool:
+    """¿La edición puede traer publicaciones que antes no entraban? Si solo
+    achica la búsqueda, todo lo que entra ya se había mostrado."""
+    b, a = dict(before), dict(after)
+    _fill_from_old_urls(b); _fill_from_old_urls(a)
+    norm = lambda xs: {_slug(x) for x in (xs or [])}
+    if norm(a.get("barrios")) - norm(b.get("barrios")):
+        return True                                            # zonas nuevas
+    if set(a.get("tipos") or ["departamento", "ph", "casa"]) - set(b.get("tipos") or ["departamento", "ph", "casa"]):
+        return True                                            # tipo nuevo
+    lo_b, lo_a = b.get("min_ambientes") or 0, a.get("min_ambientes") or 0
+    hi_b, hi_a = b.get("max_ambientes") or 99, a.get("max_ambientes") or 99
+    if lo_a < lo_b or hi_a > hi_b:
+        return True                                            # más ambientes
+    if (a.get("min_m2") or 0) < (b.get("min_m2") or 0):
+        return True                                            # entran lugares más chicos
+    cap = lambda x: [c or 10**12 for c in _price_limits(x)]   # 0 = sin tope
+    if any(na > nb for na, nb in zip(cap(a), cap(b))):
+        return True                                            # más presupuesto
+    if b.get("solo_dueno") and not a.get("solo_dueno"):
+        return True                                            # ahora también inmobiliarias
+    kb, ka = set(b.get("require_keywords") or []), set(a.get("require_keywords") or [])
+    if kb and (not ka or ka - kb):
+        return True                                            # extras menos exigentes
+    return False
+
+async def ask_resend(bot, chat_id, aid: str, before: dict | None = None, after: dict | None = None):
+    """Tras editar una alerta: ¿mostrar las de la última semana con el filtro nuevo?
+    Solo si la edición amplía la búsqueda."""
+    if not aid or (before is not None and after is not None and not _broadens(before, after)):
         return
     await bot.send_message(int(chat_id),
         "¿Querés ver las publicaciones de la última semana con el filtro nuevo?",
@@ -2526,12 +2556,13 @@ async def _apply_zone_edit(chat_id: str, aid: str, barrios: list):
             return
         alert = alerts[idx]
         _fill_from_old_urls(alert)          # conservar tipo/ambientes de alertas viejas
+        before = dict(alert)
         alert["barrios"] = barrios
         alert.update(build_search_urls(alert))
         alert["name"] = _short_name(alert)
         save_users(users)
         await send(f"✅ Barrios actualizados: <b>{html_mod.escape(lista)}</b>\n{_alert_params_line(alert)}")
-        await ask_resend(_BOT_APP.bot, chat_id, alert.get("_id"))
+        await ask_resend(_BOT_APP.bot, chat_id, alert.get("_id"), before, alert)
     except Exception as e:
         log.exception("Edición de zona: %s", e)
         await send("No pude actualizar los barrios. Probá de nuevo desde /alertas → Editar → Zona.")
