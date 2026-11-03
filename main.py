@@ -1623,9 +1623,7 @@ async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAUL
         await update.message.reply_text("Un segundo, estoy aplicando el cambio...")
         result = await interpret_search(ctx.user_data["last_desc"])
         if result and not result.get("no_es_busqueda"):
-            wiz = ctx.user_data.get("wizard", {})
-            if "expensas_incluidas" in wiz and not re.search(r"\d", desc):
-                result["_expensas_incluidas"] = wiz["expensas_incluidas"]
+            _keep_uncorrected(result, ctx.user_data.get("prev_result") or {}, desc)
             return await _show_confirmation(update, ctx, result)
         await update.message.reply_text("No pude aplicar el cambio. Contame de nuevo qué estás buscando.")
         return AWAITING_DESCRIPTION
@@ -1656,6 +1654,28 @@ async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAUL
         )
         return AWAITING_DESCRIPTION
     return await _show_confirmation(update, ctx, result)
+
+_CORR_PRICE_RE = re.compile(
+    r"precio|presupuesto|\$|mill|expensa|alquiler|plata|pesos|"
+    r"\d+(?:[.,]\d+)?\s*(?:k|mil|m)\b|\d{3,}(?:\.\d{3})*(?!\s*(?:m2|m²|metro|mts))", re.IGNORECASE)
+_CORR_M2_RE    = re.compile(r"m2|m²|metro|mts|superficie", re.IGNORECASE)
+
+def _keep_uncorrected(result: dict, prev: dict, correction: str):
+    """Tras una corrección, lo que el usuario no mencionó queda como antes
+    (sin depender de que Groq lo respete): precio y m² mínimos."""
+    if not prev:
+        return
+    if not _CORR_PRICE_RE.search(correction):
+        for k in ("max_rent_price", "max_total_price", "min_price", "_expensas_incluidas"):
+            if k in prev:
+                result[k] = prev[k]
+            else:
+                result.pop(k, None)
+        if _price_limits(result)[1]:
+            _refresh_alert_text(result, "max_total_price")
+    if not _CORR_M2_RE.search(correction) and prev.get("min_m2"):
+        result["min_m2"] = prev["min_m2"]
+        _refresh_alert_text(result, "min_m2")
 
 async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text    = update.message.text.lower().strip()
@@ -1694,6 +1714,7 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text in ("no", "n"):
         if ctx.user_data.get("last_desc"):
             ctx.user_data["correcting"] = True
+            ctx.user_data["prev_result"] = ctx.user_data.get("pending", {})
             await update.message.reply_text(
                 "¿Qué querés cambiar? Lo demás queda igual.\n"
                 "Ej: <i>que sea casa o PH</i>, <i>hasta 1M</i>, <i>agregá Saavedra</i>",
