@@ -474,6 +474,25 @@ def fetch_ml_expenses(url: str) -> tuple[str, str] | None:
     desc = soup.select_one("p.ui-pdp-description__content")
     return _expenses_info(table_val, desc.get_text(" ", strip=True) if desc else "")
 
+def fetch_remax_expenses(link: str) -> tuple[str, str] | None:
+    """(expensas, nota) desde el detalle de Remax (API findBySlug: expensesPrice +
+    descripción completa). None si no se pudo consultar."""
+    slug = link.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        resp = cffi_requests.get(f"{REMAX_API.rsplit('/', 1)[0]}/findBySlug/{slug}",
+                                 impersonate="chrome124", timeout=20)
+        data = resp.json()
+        data = data.get("data", data) if isinstance(data, dict) else {}
+    except Exception as e:
+        log.warning("[Remax] detalle %s: %s", slug, e)
+        return None
+    exp = data.get("expensesPrice")
+    return _expenses_info(str(int(exp)) if exp else "", f"{data.get('title', '')} {data.get('description', '')}")
+
+# Fuentes cuya descripción completa solo está en la publicación (ZonaProp y
+# ArgenProp ya la traen entera en la tarjeta del listado).
+DETAIL_EXPENSES = {"mercadolibre": fetch_ml_expenses, "remax": fetch_remax_expenses}
+
 _RESERVED = re.compile(r'\breservad[oa]\b', re.IGNORECASE)
 
 def _matches_exclude(text: str, rules: list) -> bool:
@@ -1598,15 +1617,18 @@ async def scrape_user(app: Application, chat_id: str, user: dict) -> int:
             else:
                 listings = scrape_mercadolibre(url)
 
-            if scraper_name == "mercadolibre":
-                # Solo publicaciones nuevas: las ya enviadas no hace falta reabrirlas.
+            detail = DETAIL_EXPENSES.get(scraper_name)
+            if detail:
+                # Expensas sin informar en el listado: se revisa la publicación
+                # (campo + descripción). Solo nuevas y que entren por alquiler.
+                rent_cap = _price_limits(alert)[0]
                 for l in listings:
-                    if not l["expenses"] and l["id"] not in seen:
-                        info = await loop.run_in_executor(
-                            None, lambda link=l["link"]: fetch_ml_expenses(link)
-                        )
-                        if info:
-                            l["expenses"], l["expenses_note"] = info
+                    if (l["expenses"] or l.get("expenses_note") or l["id"] in seen
+                            or (rent_cap and _parse_price(l["price"]) > rent_cap)):
+                        continue
+                    info = await loop.run_in_executor(None, lambda link=l["link"], f=detail: f(link))
+                    if info:
+                        l["expenses"], l["expenses_note"] = info
 
             for l in listings:
                 l.setdefault("tipo", _infer_tipo(l["link"], url or ""))
