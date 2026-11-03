@@ -765,6 +765,16 @@ def _infer_tipo(link: str, source_url: str = "") -> str:
             return _TIPO_CODES[m.group(1)]
     return ""
 
+def _compact_listing(l: dict) -> str:
+    """Una línea por publicación para las listas largas."""
+    rent, exp = _parse_price(l["price"]), _parse_price(l["expenses"])
+    precio = (f"{l['price']} + {l['expenses']} = {_fmt_ars(rent + exp)}" if l["expenses"]
+              else f"{l['price']} ({l.get('expenses_note') or 'expensas no informadas'})")
+    m2 = _m2_total(l.get("features", ""))[0]
+    tipo = l.get("tipo", "")
+    return (f"{TIPO_ICON.get(tipo, '🏠')} <b>{html_mod.escape(l['address'][:60])}</b>\n"
+            f"{html_mod.escape(precio)}" + (f" · {m2} m²" if m2 else "") + f' · <a href="{l["link"]}">Ver</a>')
+
 def format_listing(l: dict) -> str:
     rent     = _parse_price(l["price"])
     expenses = _parse_price(l["expenses"])
@@ -2085,8 +2095,8 @@ async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: 
                         + (" en los sitios que respondieron." if note else ".")
                         + " Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo.") + note)
         else:
-            await send(f"Te mandé {count} publicación(es) de la última semana"
-                       + (f" (las más recientes; había {more} más, que no te mando para no llenarte el chat)" if more else "")
+            await send(f"Te mandé {count + more} publicación(es) de la última semana"
+                       + (f": {count} con detalle y {more} más en listas" if more else "")
                        + ". Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo." + note)
         await send("💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento.")
         await send("¿Querés agregar otra alerta con distintos criterios?",
@@ -2204,6 +2214,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
     loop  = asyncio.get_event_loop()
     failed_sources.pop(chat_id, None)
     skipped_sends.pop(chat_id, None)
+    overflow: list = []
 
     for alert in get_alerts(user):
         if only_alert and alert.get("_id") != only_alert:
@@ -2281,9 +2292,9 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             new = [l for l in listings if l["id"] not in seen]
 
             for l in new:
-                if max_send is not None and total >= max_send:
-                    seen.add(l["id"])            # superó el tope: se marca vista sin mandar
-                    skipped_sends[chat_id] = skipped_sends.get(chat_id, 0) + 1
+                if max_send is not None and total + len(overflow) >= max_send:
+                    overflow.append(l)           # pasado el tope: va en las listas compactas
+                    seen.add(l["id"])
                     continue
                 try:
                     await app.bot.send_message(
@@ -2299,6 +2310,19 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
                 except Exception as e:
                     log.error("Error sending to %s: %s", chat_id, e)
 
+    # Lo que pasó el tope del envío inicial: todo igual, pero de a 10 por mensaje.
+    for i in range(0, len(overflow), 10):
+        chunk = overflow[i:i + 10]
+        text  = (f"📋 Más publicaciones ({i + 1}-{i + len(chunk)} de {len(overflow)}):\n\n"
+                 + "\n\n".join(_compact_listing(l) for l in chunk))
+        try:
+            await app.bot.send_message(int(chat_id), text, parse_mode="HTML", disable_web_page_preview=True)
+            await asyncio.sleep(0.6)
+        except Exception as e:
+            log.error("Error sending list to %s: %s", chat_id, e)
+    if overflow:
+        skipped_sends[chat_id] = len(overflow)
+        log.info("Enviado a %s | %d publicaciones más en %d listas", chat_id[-4:], len(overflow), (len(overflow) + 9) // 10)
     user["seen"] = sorted(seen)
     return total
 
