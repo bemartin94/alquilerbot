@@ -1566,9 +1566,8 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         result["_editing_idx"] = idx
         ctx.user_data["pending"] = result
         await update.message.reply_text(
-            f"Nueva versión:\n\n<b>{result['summary']}</b>\n\n"
-            "¿Confirmás? Respondé <b>si</b> o <b>no</b>.",
-            parse_mode="HTML"
+            f"Nueva versión:\n\n<b>{result['summary']}</b>\n\n¿Confirmás?",
+            parse_mode="HTML", reply_markup=_confirm_kb(),
         )
         return AWAITING_CONFIRMATION
 
@@ -1595,8 +1594,8 @@ async def handle_edit_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ctx.user_data["pending"] = result
     await update.message.reply_text(
         f"Nueva versión:\n\n<b>{result['summary']}</b>\n\n"
-        "¿Confirmás el reemplazo? Respondé <b>si</b> o <b>no</b>.",
-        parse_mode="HTML"
+        "¿Confirmás el reemplazo?",
+        parse_mode="HTML", reply_markup=_confirm_kb(),
     )
     return AWAITING_CONFIRMATION
 
@@ -1783,8 +1782,8 @@ async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, res
     msg = f"Esto es lo que entendí:\n\n<b>{result['summary']}</b>\n\n"
     if price_note:
         msg += f"{price_note}\n\n"
-    msg += "¿Confirmás? Respondé <b>si</b> o <b>no</b>."
-    await update.message.reply_text(msg, parse_mode="HTML")
+    msg += "¿Confirmás?"
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=_confirm_kb())
     return AWAITING_CONFIRMATION
 
 # ── Entry point: routes to wizard or free-text ────────────────────────────────
@@ -1922,9 +1921,24 @@ def _keep_uncorrected(result: dict, prev: dict, correction: str, total_default: 
         result["min_m2"] = prev["min_m2"]
         _refresh_alert_text(result, "min_m2")
 
+def _confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Sí, guardar",  callback_data="confirm_si"),
+        InlineKeyboardButton("✏️ No, corregir", callback_data="confirm_no"),
+    ]])
+
 async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text    = update.message.text.lower().strip()
+    """Confirmación con botones (o escribiendo si / no)."""
     chat_id = str(update.effective_chat.id)
+    query   = update.callback_query
+    if query:
+        await query.answer()
+        text = "si" if query.data == "confirm_si" else "no"
+        await query.edit_message_reply_markup(reply_markup=None)   # sin botones viejos
+        reply = lambda t, **kw: ctx.bot.send_message(query.message.chat_id, t, **kw)
+    else:
+        text  = update.message.text.lower().strip()
+        reply = update.message.reply_text
 
     if text in ("si", "sí", "yes", "s", "ok", "dale", "confirmo"):
         alert   = ctx.user_data.pop("pending", {})
@@ -1935,7 +1949,7 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if user and "alerts" in user and edit_idx < len(user["alerts"]):
                 user["alerts"][edit_idx] = alert
                 save_users(users)
-            await update.message.reply_text(
+            await reply(
                 f"Alerta actualizada: <b>{alert.get('name') or alert.get('summary','')}</b>",
                 parse_mode="HTML"
             )
@@ -1946,7 +1960,7 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📬 Última semana + las nuevas", callback_data="initial_week")],
             [InlineKeyboardButton("🔔 Solo las nuevas", callback_data="initial_new")],
         ])
-        await update.message.reply_text(
+        await reply(
             f"✅ Alerta guardada: <b>{html_mod.escape(alert.get('name') or alert.get('summary', ''))}</b>\n\n"
             "En los dos casos te aviso de cada publicación nueva que aparezca. "
             "¿Querés además las que ya están publicadas?\n"
@@ -1961,16 +1975,16 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if ctx.user_data.get("last_desc"):
             ctx.user_data["correcting"] = True
             ctx.user_data["prev_result"] = ctx.user_data.get("pending", {})
-            await update.message.reply_text(
+            await reply(
                 "¿Qué querés cambiar? Lo demás queda igual.\n"
                 "Ej: <i>que sea casa o PH</i>, <i>hasta 1M</i>, <i>agregá Saavedra</i>",
                 parse_mode="HTML",
             )
         else:
-            await update.message.reply_text("Contame de nuevo qué estás buscando. Podés ser más específico.")
+            await reply("Contame de nuevo qué estás buscando. Podés ser más específico.")
         return AWAITING_DESCRIPTION
 
-    await update.message.reply_text("Respondé <b>si</b> o <b>no</b>.", parse_mode="HTML")
+    await reply("Tocá uno de los botones de arriba 👆 (o escribí <b>si</b> / <b>no</b>).", parse_mode="HTML")
     return AWAITING_CONFIRMATION
 
 async def handle_initial_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2275,7 +2289,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_dueno_text),
             ],
             AWAITING_EXTRAS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_extras)],
-            AWAITING_CONFIRMATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirmation)],
+            AWAITING_CONFIRMATION: [
+                CallbackQueryHandler(handle_confirmation, pattern="^confirm_(si|no)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirmation),
+            ],
             AWAITING_INITIAL_SEND: [
                 CallbackQueryHandler(handle_initial_send, pattern="^initial_(week|new)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_initial_send_text),
