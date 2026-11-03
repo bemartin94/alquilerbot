@@ -2062,31 +2062,40 @@ async def handle_initial_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ("🔔 Te aviso solo de las nuevas." if only_new else "📬 Buscando las de la última semana..."),
         parse_mode="HTML",
     )
-    users = load_users()
-    user  = users.get(chat_id, {})
-    count = await scrape_user(ctx.application, chat_id, user, only_alert=aid,
-                              silent=only_new, max_age=INITIAL_SEND_DAYS)
-    _merge_seen(chat_id, user.get("seen", []))
-    release_memory()
-    note = _failed_note(chat_id)
-    if only_new:
-        await send("Listo. Voy a revisar cada 15 minutos y te aviso apenas aparezca algo nuevo." + note)
-    elif count == 0:
-        await send(("No encontré publicaciones de la última semana que coincidan"
-                    + (" en los sitios que respondieron." if note else ".")
-                    + " Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo.") + note)
-    else:
-        await send(f"Te mandé {count} publicación(es) de la última semana. "
-                   "Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo." + note)
-    await send("💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento.")
-    await ctx.bot.send_message(
-        query.message.chat_id, "¿Querés agregar otra alerta con distintos criterios?",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("➕ Sí, otra alerta", callback_data="more_si"),
-            InlineKeyboardButton("👍 No, listo",       callback_data="more_no"),
-        ]]),
-    )
+    # En segundo plano: mandar muchas publicaciones tarda minutos y, mientras tanto,
+    # el bot tiene que seguir respondiendo a todos.
+    task = asyncio.create_task(_initial_send_job(ctx.application, chat_id, aid, only_new))
+    _bg_tasks.add(task); task.add_done_callback(_bg_tasks.discard)
     return AWAITING_MORE_ALERTS
+
+async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: bool):
+    send = lambda text, **kw: app.bot.send_message(int(chat_id), text, **kw)
+    try:
+        user  = load_users().get(chat_id, {})
+        count = await scrape_user(app, chat_id, user, only_alert=aid, silent=only_new,
+                                  max_age=INITIAL_SEND_DAYS, max_send=INITIAL_MAX_SEND)
+        _merge_seen(chat_id, user.get("seen", []))
+        release_memory()
+        note = _failed_note(chat_id)
+        more = skipped_sends.get(chat_id, 0)
+        if only_new:
+            await send("Listo. Voy a revisar cada 15 minutos y te aviso apenas aparezca algo nuevo." + note)
+        elif count == 0:
+            await send(("No encontré publicaciones de la última semana que coincidan"
+                        + (" en los sitios que respondieron." if note else ".")
+                        + " Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo.") + note)
+        else:
+            await send(f"Te mandé {count} publicación(es) de la última semana"
+                       + (f" (las más recientes; había {more} más, que no te mando para no llenarte el chat)" if more else "")
+                       + ". Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo." + note)
+        await send("💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento.")
+        await send("¿Querés agregar otra alerta con distintos criterios?",
+                   reply_markup=InlineKeyboardMarkup([[
+                       InlineKeyboardButton("➕ Sí, otra alerta", callback_data="more_si"),
+                       InlineKeyboardButton("👍 No, listo",       callback_data="more_no"),
+                   ]]))
+    except Exception as e:
+        log.exception("Envío inicial para %s: %s", chat_id, e)
 
 async def handle_initial_send_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Elegí una de las dos opciones de arriba 👆")
@@ -2152,6 +2161,17 @@ def _site_result(site: str, ok: bool):
     except OSError:
         pass
 
+_net_lock: asyncio.Lock | None = None
+
+async def _run_blocking(fn, *args):
+    """Corre un pedido HTTP (bloqueante) en un hilo aparte, de a uno por vez:
+    el bot sigue respondiendo y las sesiones de curl no se usan en paralelo."""
+    global _net_lock
+    if _net_lock is None:
+        _net_lock = asyncio.Lock()
+    async with _net_lock:
+        return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
 async def _polite_wait(site: str):
     """Espacia los pedidos a un mismo sitio (sin bloquear al bot mientras espera)."""
     import random
@@ -2163,6 +2183,8 @@ async def _polite_wait(site: str):
 
 SOURCE_NAMES   = {"zonaprop": "ZonaProp", "argenprop": "ArgenProp", "mercadolibre": "MercadoLibre", "remax": "Remax"}
 failed_sources: dict = {}   # chat_id -> sitios que no respondieron en su última revisión
+skipped_sends: dict = {}    # chat_id -> publicaciones no mandadas por el tope del envío inicial
+INITIAL_MAX_SEND = 20
 
 def _failed_note(chat_id: str) -> str:
     f = sorted(failed_sources.get(chat_id, ()))
@@ -2173,7 +2195,7 @@ def _failed_note(chat_id: str) -> str:
             "(suelen bloquear un rato). Los vuelvo a probar solo y, apenas respondan, te aviso si aparece algo.")
 
 async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: str | None = None,
-                      silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS) -> int:
+                      silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS, max_send: int | None = None) -> int:
     """Scrape the user's alerts (or only `only_alert`, by _id). Returns how many
     new listings were sent. With silent=True nothing is sent: every listing
     currently published is marked as seen, so only future ones are notified."""
@@ -2181,6 +2203,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
     total = 0
     loop  = asyncio.get_event_loop()
     failed_sources.pop(chat_id, None)
+    skipped_sends.pop(chat_id, None)
 
     for alert in get_alerts(user):
         if only_alert and alert.get("_id") != only_alert:
@@ -2212,17 +2235,17 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             if listings is not None:
                 pass
             elif scraper_name == "zonaprop":
-                listings = scrape_zonaprop(url)
+                listings = await _run_blocking(scrape_zonaprop, url)
             elif scraper_name == "remax":
-                listings = scrape_remax(alert, remax_params(alert, user))
+                listings = await _run_blocking(scrape_remax, alert, remax_params(alert, user))
             elif scraper_name == "argenprop":
-                listings = scrape_argenprop(url)
+                listings = await _run_blocking(scrape_argenprop, url)
                 if "/dueno-directo/" in (url or ""):
                     for l in listings:
                         l["owner"] = True   # ya filtrado por ArgenProp
                     log.info("[ArgenProp] dueño directo: %d listings", len(listings))
             else:
-                listings = scrape_mercadolibre(url)
+                listings = await _run_blocking(scrape_mercadolibre, url)
 
             if _cycle_cache is None or key not in _cycle_cache:
                 blocked = bool(_fetch_failures) and not listings
@@ -2246,7 +2269,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
                         continue
                     if (l["expenses"] or l.get("expenses_note")) and not need_owner:
                         continue
-                    info = await loop.run_in_executor(None, lambda link=l["link"], f=detail: f(link))
+                    info = await _run_blocking(lambda link=l["link"], f=detail: f(link))
                     if info and not (l["expenses"] or l.get("expenses_note")):
                         l["expenses"], l["expenses_note"] = info
                     if scraper_name == "mercadolibre":
@@ -2258,6 +2281,10 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             new = [l for l in listings if l["id"] not in seen]
 
             for l in new:
+                if max_send is not None and total >= max_send:
+                    seen.add(l["id"])            # superó el tope: se marca vista sin mandar
+                    skipped_sends[chat_id] = skipped_sends.get(chat_id, 0) + 1
+                    continue
                 try:
                     await app.bot.send_message(
                         chat_id=int(chat_id),
@@ -2521,7 +2548,7 @@ def main():
     scheduler.start()
     log.info("Bot iniciado. Scrapeando cada 15 minutos.")
 
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)   # lo que llegue durante un reinicio se responde igual
 
 if __name__ == "__main__":
     main()
