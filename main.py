@@ -2185,6 +2185,7 @@ async def _initial_send_job(app: Application, chat_id: str, aid: str, only_new: 
         note = _failed_note(chat_id)
         n = len(found)
         if after_edit:
+            log.info("Reenvío tras edición a %s: %d encontradas", chat_id[-4:], n)
             if only_new:
                 await send("Listo, con el filtro nuevo te aviso solo de las publicaciones que aparezcan de acá en adelante." + note)
             elif n == 0:
@@ -2255,10 +2256,13 @@ async def ask_resend(bot, chat_id, aid: str, before: dict | None = None, after: 
 async def handle_resend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     chat_id = str(query.message.chat_id)
-    await query.answer()
-    await query.edit_message_reply_markup(reply_markup=None)
     yes, _, aid = query.data.partition(":")
     only_new = yes == "resend_no"
+    await query.answer("Buscando..." if not only_new else "Listo")
+    await query.edit_message_text(
+        "🔔 Listo, solo las nuevas." if only_new else
+        "🔎 Buscando las de la última semana con el filtro nuevo... Puede tardar un par de minutos; te las mando acá.")
+    log.info("Reenvío tras edición para %s (alerta %s, %s)", chat_id[-4:], aid, "solo nuevas" if only_new else "última semana")
     task = asyncio.create_task(_initial_send_job(ctx.application, chat_id, aid, only_new, after_edit=True))
     _bg_tasks.add(task); task.add_done_callback(_bg_tasks.discard)
 
