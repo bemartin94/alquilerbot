@@ -1237,7 +1237,7 @@ def _alert_params_line(a: dict) -> str:
     """Valores reales de la alerta (no dependen del texto que armó Groq)."""
     parts = []
     if a.get("min_m2"):
-        parts.append(f"📐 {a['min_m2']} m² totales mín.")
+        parts.append(f"📐 {a['min_m2']} m² totales o más")
     rent_cap, total_cap = _price_limits(a)
     if total_cap:
         parts.append(f"💰 hasta {_fmt_ars(total_cap)} total")
@@ -1797,9 +1797,13 @@ async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, res
     else:
         price_note = "💰 Precio: sin tope (no indicaste un máximo)"
     msg = f"Esto es lo que entendí:\n\n<b>{result['summary']}</b>\n\n"
+    if result.get("min_m2"):
+        msg += f"📐 Superficie: {result['min_m2']} m² totales o más\n"
     if price_note:
-        msg += f"{price_note}\n\n"
-    msg += "¿Confirmás?"
+        msg += f"{price_note}\n"
+    if result.get("solo_dueno"):
+        msg += "👤 Solo dueño directo\n"
+    msg += "\n¿Confirmás?"
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=_confirm_kb())
     return AWAITING_CONFIRMATION
 
