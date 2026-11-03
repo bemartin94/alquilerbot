@@ -627,6 +627,11 @@ Ejemplos:
 - "sin monoambientes" → ["monoambiente"]
 Dejá el array vacío si no hay exclusiones.
 
+## Mensajes que NO son búsquedas
+Si el mensaje del usuario NO describe una propiedad que quiere alquilar (por ejemplo: un saludo,
+una pregunta sobre el bot, el nombre de un comando como "alertas" o "ayuda", o texto sin relación),
+NO inventes una búsqueda. Devolvé exactamente: {"no_es_busqueda": true}
+
 ## Respuesta (SOLO JSON, nada más):
 {
   "name": "nombre corto descriptivo de esta alerta (ej: Deptos 2amb Palermo)",
@@ -912,7 +917,8 @@ COMMANDS_TEXT = (
     "/alertas — ver, editar o borrar tus alertas\n"
     "/stop — pausar las notificaciones\n"
     "/resetseen — volver a ver publicaciones ya mostradas\n"
-    "/borrartodo — eliminar todas las alertas"
+    "/borrartodo — eliminar todas las alertas\n"
+    "/help — ver esta lista de comandos"
 )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -922,6 +928,45 @@ async def fallback_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "No entendí eso. Si querés buscar departamentos usá /buscar.\n\n" + COMMANDS_TEXT
     )
+
+# Palabras sueltas que coinciden con un comando (escritas sin la "/")
+_COMMAND_WORDS = {
+    "buscar": "buscar", "busqueda": "buscar", "nueva alerta": "buscar",
+    "alertas": "alertas", "alerta": "alertas", "mis alertas": "alertas",
+    "ver alertas": "alertas", "estado": "alertas",
+    "stop": "stop", "pausar": "stop", "parar": "stop",
+    "resetseen": "resetseen",
+    "borrartodo": "borrartodo", "borrar todo": "borrartodo",
+    "borrar": "alertas", "editar": "alertas",
+}
+# Mensajes que claramente no son una búsqueda
+_NON_SEARCH_WORDS = {
+    "help", "ayuda", "comandos", "comando", "menu", "opciones", "info",
+    "start", "inicio", "hola", "holaa", "buenas", "buen dia", "buenos dias",
+    "buenas tardes", "buenas noches", "hey", "hi", "hello",
+    "gracias", "muchas gracias", "ok", "okey", "dale", "listo", "genial",
+    "chau", "adios", "?", "que hago", "como funciona", "que podes hacer",
+}
+
+def _non_search_reply(text: str) -> str | None:
+    """If `text` is not a property search (a command word without '/', a greeting,
+    a help request...), return the reply listing the commands. Otherwise None."""
+    t = _norm(text)
+    t = re.sub(r"[^\w\s?]", " ", t)           # drop "/", "!", "¿", etc.
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return COMMANDS_TEXT
+    if t in _COMMAND_WORDS:
+        return f"¿Quisiste decir /{_COMMAND_WORDS[t]}? Los comandos van con una barra «/» adelante.\n\n" + COMMANDS_TEXT
+    if t in _NON_SEARCH_WORDS or t.rstrip("?! ") in _NON_SEARCH_WORDS:
+        return COMMANDS_TEXT
+    return None
+
+async def _reply_non_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, reply: str):
+    """Show the commands and leave the conversation so the next message starts fresh."""
+    ctx.user_data.pop("pending", None)
+    await update.message.reply_text(reply, parse_mode="HTML")
+    return ConversationHandler.END
 
 async def cmd_editar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -1253,6 +1298,10 @@ async def receive_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Entry point for plain text. If /submit-zones set a wizard step, start wizard."""
     chat_id = str(update.effective_chat.id)
     step = load_users().get(chat_id, {}).get("_wizard_step")
+    if step != "ambientes":
+        reply = _non_search_reply(update.message.text or "")
+        if reply:
+            return await _reply_non_search(update, ctx, reply)
     if step == "ambientes":
         # Clear the flag (PTB takes over from here)
         users = load_users()
@@ -1266,6 +1315,9 @@ async def receive_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     desc         = update.message.text.strip()
     chat_id      = str(update.effective_chat.id)
+    reply = _non_search_reply(desc)
+    if reply:
+        return await _reply_non_search(update, ctx, reply)
     if len(desc) < 5:
         await update.message.reply_text(
             "La descripción es muy corta. Contame qué estás buscando, ej: <i>2 ambientes en Palermo, hasta 800k total</i>",
@@ -1281,6 +1333,13 @@ async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAUL
         desc = f"Zonas preferidas del usuario (usá estas si no menciona otras): {', '.join(barrios_mapa)}. Descripción: {desc}"
     await update.message.reply_text("Un segundo, estoy interpretando tu búsqueda...")
     result = await interpret_search(desc)
+    if result and result.get("no_es_busqueda"):
+        return await _reply_non_search(
+            update, ctx,
+            "Eso no parece una búsqueda de propiedad. Si querés crear una alerta, "
+            "contame qué buscás (ej: <i>2 ambientes en Palermo hasta 800k</i>) o usá /buscar.\n\n"
+            + COMMANDS_TEXT,
+        )
     if not result:
         await update.message.reply_text(
             "No pude interpretar la búsqueda. "
@@ -1340,6 +1399,9 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Contame de nuevo qué estás buscando. Podés ser más específico.")
         return AWAITING_DESCRIPTION
 
+    reply = _non_search_reply(text)
+    if reply:
+        return await _reply_non_search(update, ctx, reply)
     await update.message.reply_text("Respondé <b>si</b> o <b>no</b>.", parse_mode="HTML")
     return AWAITING_CONFIRMATION
 
@@ -1576,6 +1638,7 @@ def main():
     app.add_handler(CommandHandler("resetseen",  cmd_resetseen))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_unknown))
+    app.add_handler(MessageHandler(filters.COMMAND, fallback_unknown))  # /comandos desconocidos
 
     # Start HTTP server and scraper scheduler
     global _BOT_APP
