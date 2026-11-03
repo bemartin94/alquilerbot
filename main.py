@@ -30,6 +30,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
+    ApplicationHandlerStop,
     ContextTypes,
     MessageHandler,
     filters,
@@ -925,48 +926,47 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(COMMANDS_TEXT)
 
 async def fallback_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "No entendí eso. Si querés buscar departamentos usá /buscar.\n\n" + COMMANDS_TEXT
-    )
+    await update.message.reply_text(REJECT_TEXT)
 
-# Palabras sueltas que coinciden con un comando (escritas sin la "/")
-_COMMAND_WORDS = {
-    "buscar": "buscar", "busqueda": "buscar", "nueva alerta": "buscar",
-    "alertas": "alertas", "alerta": "alertas", "mis alertas": "alertas",
-    "ver alertas": "alertas", "estado": "alertas",
-    "stop": "stop", "pausar": "stop", "parar": "stop",
-    "resetseen": "resetseen",
-    "borrartodo": "borrartodo", "borrar todo": "borrartodo",
-    "borrar": "alertas", "editar": "alertas",
+# ── Rechazo de comandos escritos como texto ───────────────────────────────────
+# Nombres de comando (con o sin "/") que, si aparecen como palabra en el mensaje,
+# indican que no es una búsqueda.
+_CMD_ANYWHERE = {"alertas", "resetseen", "borrartodo", "comandos", "help"}
+# Palabras que, si son la PRIMERA del mensaje, indican un comando/pedido de ayuda.
+_CMD_FIRST_WORD = {
+    "alerta", "alertas", "stop", "estado", "borrar", "editar", "start", "help",
+    "ayuda", "comando", "comandos", "menu", "inicio", "opciones", "pausar",
+    "resetseen", "borrartodo",
 }
-# Mensajes que claramente no son una búsqueda
-_NON_SEARCH_WORDS = {
-    "help", "ayuda", "comandos", "comando", "menu", "opciones", "info",
-    "start", "inicio", "hola", "holaa", "buenas", "buen dia", "buenos dias",
-    "buenas tardes", "buenas noches", "hey", "hi", "hello",
-    "gracias", "muchas gracias", "ok", "okey", "dale", "listo", "genial",
-    "chau", "adios", "?", "que hago", "como funciona", "que podes hacer",
+# Mensajes completos que son comandos o no son búsquedas (saludos, etc.).
+_NON_SEARCH_MSGS = {
+    "buscar", "busqueda", "nueva alerta", "mis alertas", "ver alertas", "borrar todo",
+    "hola", "holaa", "buenas", "buen dia", "buenos dias", "buenas tardes",
+    "buenas noches", "hey", "hi", "hello", "gracias", "muchas gracias",
+    "chau", "adios", "info", "que hago", "como funciona", "que podes hacer",
 }
 
-def _non_search_reply(text: str) -> str | None:
-    """If `text` is not a property search (a command word without '/', a greeting,
-    a help request...), return the reply listing the commands. Otherwise None."""
+REJECT_TEXT = "Eso no es una búsqueda.\n\n" + COMMANDS_TEXT
+
+def _is_command_like(text: str) -> bool:
+    """True si el mensaje es (o parece) un comando o un saludo, no una búsqueda."""
     t = _norm(text)
-    t = re.sub(r"[^\w\s?]", " ", t)           # drop "/", "!", "¿", etc.
+    if t.startswith("/"):
+        return True
+    t = re.sub(r"[^\w\s]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        return COMMANDS_TEXT
-    if t in _COMMAND_WORDS:
-        return f"¿Quisiste decir /{_COMMAND_WORDS[t]}? Los comandos van con una barra «/» adelante.\n\n" + COMMANDS_TEXT
-    if t in _NON_SEARCH_WORDS or t.rstrip("?! ") in _NON_SEARCH_WORDS:
-        return COMMANDS_TEXT
-    return None
+    if not t or t in _NON_SEARCH_MSGS:
+        return True
+    words = t.split()
+    return words[0] in _CMD_FIRST_WORD or any(w in _CMD_ANYWHERE for w in words)
 
-async def _reply_non_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, reply: str):
-    """Show the commands and leave the conversation so the next message starts fresh."""
-    ctx.user_data.pop("pending", None)
-    await update.message.reply_text(reply, parse_mode="HTML")
-    return ConversationHandler.END
+async def reject_command_like(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Corre antes que cualquier otro handler: si el texto es un comando, lo
+    rechaza mostrando la lista de comandos y corta el procesamiento."""
+    msg = update.message
+    if msg and msg.text and _is_command_like(msg.text):
+        await msg.reply_text(REJECT_TEXT)
+        raise ApplicationHandlerStop
 
 async def cmd_editar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -1295,13 +1295,10 @@ async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, res
 # ── Entry point: routes to wizard or free-text ────────────────────────────────
 
 async def receive_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Entry point for plain text. If /submit-zones set a wizard step, start wizard."""
+    """Plain text outside a flow. Only continues if /submit-zones (map) set a wizard
+    step; otherwise the message is rejected with the command list."""
     chat_id = str(update.effective_chat.id)
     step = load_users().get(chat_id, {}).get("_wizard_step")
-    if step != "ambientes":
-        reply = _non_search_reply(update.message.text or "")
-        if reply:
-            return await _reply_non_search(update, ctx, reply)
     if step == "ambientes":
         # Clear the flag (PTB takes over from here)
         users = load_users()
@@ -1310,14 +1307,20 @@ async def receive_description(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # barrios already saved; load them into user_data
         ctx.user_data["barrios_mapa"] = users[chat_id].get("zones", [])
         return await handle_wizard_ambientes(update, ctx)
+    # Texto suelto fuera de un flujo conversacional: no es una búsqueda.
+    await update.message.reply_text(REJECT_TEXT)
+    return ConversationHandler.END
+
+async def receive_description_in_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Plain text while /buscar asks about zones: map wizard step or free-text search."""
+    chat_id = str(update.effective_chat.id)
+    if load_users().get(chat_id, {}).get("_wizard_step") == "ambientes":
+        return await receive_description(update, ctx)
     return await _receive_description_freetext(update, ctx)
 
 async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     desc         = update.message.text.strip()
     chat_id      = str(update.effective_chat.id)
-    reply = _non_search_reply(desc)
-    if reply:
-        return await _reply_non_search(update, ctx, reply)
     if len(desc) < 5:
         await update.message.reply_text(
             "La descripción es muy corta. Contame qué estás buscando, ej: <i>2 ambientes en Palermo, hasta 800k total</i>",
@@ -1334,12 +1337,9 @@ async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAUL
     await update.message.reply_text("Un segundo, estoy interpretando tu búsqueda...")
     result = await interpret_search(desc)
     if result and result.get("no_es_busqueda"):
-        return await _reply_non_search(
-            update, ctx,
-            "Eso no parece una búsqueda de propiedad. Si querés crear una alerta, "
-            "contame qué buscás (ej: <i>2 ambientes en Palermo hasta 800k</i>) o usá /buscar.\n\n"
-            + COMMANDS_TEXT,
-        )
+        ctx.user_data.pop("pending", None)
+        await update.message.reply_text(REJECT_TEXT)
+        return ConversationHandler.END
     if not result:
         await update.message.reply_text(
             "No pude interpretar la búsqueda. "
@@ -1399,9 +1399,6 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Contame de nuevo qué estás buscando. Podés ser más específico.")
         return AWAITING_DESCRIPTION
 
-    reply = _non_search_reply(text)
-    if reply:
-        return await _reply_non_search(update, ctx, reply)
     await update.message.reply_text("Respondé <b>si</b> o <b>no</b>.", parse_mode="HTML")
     return AWAITING_CONFIRMATION
 
@@ -1599,7 +1596,7 @@ def main():
             AWAITING_ZONE_CONFIRM: [
                 CallbackQueryHandler(handle_zone_confirm, pattern="^zones_keep$"),
                 MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_description),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_description_in_flow),
             ],
             AWAITING_DESCRIPTION:  [
                 MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data),
@@ -1627,6 +1624,8 @@ def main():
         allow_reentry=True,
     )
 
+    # Grupo -1: se evalúa antes que la conversación y los comandos.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reject_command_like), group=-1)
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_alert_del_button, pattern=r"^alert_del:[\w]+$"))
     app.add_handler(CommandHandler("stop",       cmd_stop))
