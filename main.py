@@ -277,6 +277,9 @@ def fetch(url: str, referer: str) -> BeautifulSoup | None:
             resp = _session(imp).get(url, headers={"Referer": referer}, timeout=30)
             if resp.status_code == 200:
                 return BeautifulSoup(resp.content, "lxml", from_encoding="utf-8")
+            if resp.status_code == 404:   # búsqueda sin resultados / URL inexistente: no es un bloqueo
+                log.info("Fetch %s: HTTP 404 (sin resultados)", url)
+                return None
             log.warning("Fetch %s (%s): HTTP %s", url, imp, resp.status_code)
             if resp.headers.get("x-amzn-waf-action"):
                 break  # AWS WAF challenge: retrying with another profile only extends the block
@@ -2112,6 +2115,52 @@ async def handle_more_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ── Scraper job ────────────────────────────────────────────────────────────────
+# ── Bloqueos: pausa automática por sitio ──────────────────────────────────────
+# Seguir pidiendo a un sitio que bloquea alarga el bloqueo. Tras un bloqueo el
+# sitio queda en pausa (15, 30, 60... hasta 180 min); al vencer se hace un solo
+# pedido de prueba y, si responde, se vuelve a usar enseguida.
+SITE_STATE_FILE = DATA_DIR / "site_state.json"
+_BACKOFF_MIN    = (15, 30, 60, 120, 180)
+_REQ_GAP        = (3.0, 7.0)          # segundos al azar entre pedidos al mismo sitio
+_last_request: dict = {}              # sitio -> time.time() del último pedido
+_cycle_cache: dict | None = None      # (sitio, url) -> listings, solo durante una vuelta
+
+def _site_state() -> dict:
+    try:
+        return json.loads(SITE_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+def _site_paused(site: str) -> float:
+    """Segundos que faltan para volver a probar el sitio (0 = disponible)."""
+    return max(0.0, _site_state().get(site, {}).get("until", 0) - time.time())
+
+def _site_result(site: str, ok: bool):
+    st = _site_state()
+    cur = st.get(site, {})
+    if ok:
+        if cur.get("fails"):
+            log.info("[%s] respondió de nuevo, se reanuda", site)
+        st.pop(site, None)
+    else:
+        fails = cur.get("fails", 0) + 1
+        mins  = _BACKOFF_MIN[min(fails, len(_BACKOFF_MIN)) - 1]
+        st[site] = {"fails": fails, "until": time.time() + mins * 60, "since": cur.get("since", time.time())}
+        log.warning("[%s] bloqueado (%d seguidos): pausa de %d min", site, fails, mins)
+    try:
+        tmp = SITE_STATE_FILE.with_suffix(".tmp"); tmp.write_text(json.dumps(st)); os.replace(tmp, SITE_STATE_FILE)
+    except OSError:
+        pass
+
+async def _polite_wait(site: str):
+    """Espacia los pedidos a un mismo sitio (sin bloquear al bot mientras espera)."""
+    import random
+    gap  = random.uniform(*_REQ_GAP)
+    wait = _last_request.get(site, 0) + gap - time.time()
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _last_request[site] = time.time()
+
 SOURCE_NAMES   = {"zonaprop": "ZonaProp", "argenprop": "ArgenProp", "mercadolibre": "MercadoLibre", "remax": "Remax"}
 failed_sources: dict = {}   # chat_id -> sitios que no respondieron en su última revisión
 
@@ -2121,7 +2170,7 @@ def _failed_note(chat_id: str) -> str:
         return ""
     sitios = " y ".join([", ".join(f[:-1]), f[-1]]) if len(f) > 1 else f[0]
     return (f"\n\n⚠️ {sitios} no {'respondieron' if len(f) > 1 else 'respondió'} ahora "
-            "(suelen bloquear un rato). Los vuelvo a revisar en cada vuelta y te aviso si aparece algo.")
+            "(suelen bloquear un rato). Los vuelvo a probar solo y, apenas respondan, te aviso si aparece algo.")
 
 async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: str | None = None,
                       silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS) -> int:
@@ -2151,7 +2200,18 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
         )
         for scraper_name, url in sources:
             _fetch_failures.clear()
-            if scraper_name == "zonaprop":
+            key = (scraper_name, url or repr(remax_params(alert, user)) if scraper_name == "remax" else url)
+            if _cycle_cache is not None and key in _cycle_cache:     # misma búsqueda ya hecha en esta vuelta
+                listings = [dict(l) for l in _cycle_cache[key]]
+            elif _site_paused(scraper_name):
+                failed_sources.setdefault(chat_id, set()).add(SOURCE_NAMES[scraper_name])
+                continue
+            else:
+                await _polite_wait(scraper_name)
+                listings = None
+            if listings is not None:
+                pass
+            elif scraper_name == "zonaprop":
                 listings = scrape_zonaprop(url)
             elif scraper_name == "remax":
                 listings = scrape_remax(alert, remax_params(alert, user))
@@ -2164,8 +2224,13 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
             else:
                 listings = scrape_mercadolibre(url)
 
-            if _fetch_failures and not listings:
-                failed_sources.setdefault(chat_id, set()).add(SOURCE_NAMES[scraper_name])
+            if _cycle_cache is None or key not in _cycle_cache:
+                blocked = bool(_fetch_failures) and not listings
+                _site_result(scraper_name, not blocked)
+                if blocked:
+                    failed_sources.setdefault(chat_id, set()).add(SOURCE_NAMES[scraper_name])
+                elif _cycle_cache is not None:
+                    _cycle_cache[key] = [dict(l) for l in listings]
             if silent:
                 seen.update(l["id"] for l in listings)
                 continue
@@ -2211,9 +2276,17 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
     return total
 
 async def scrape_all(app: Application):
+    global _cycle_cache
     users = load_users()
     if not users:
         return
+    _cycle_cache = {}
+    try:
+        await _scrape_all_users(app, users)
+    finally:
+        _cycle_cache = None
+
+async def _scrape_all_users(app: Application, users: dict):
     for chat_id, user in users.items():
         if not user.get("active", True):
             continue
