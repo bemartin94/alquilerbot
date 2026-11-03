@@ -58,6 +58,8 @@ AWAITING_EXPENSAS     = 10
 AWAITING_EXTRAS       = 11
 AWAITING_EDIT_CHOICE  = 12
 AWAITING_EDIT_FIELD   = 13
+AWAITING_INITIAL_SEND = 14
+INITIAL_SEND_DAYS     = 7   # "las de la última semana" al guardar una alerta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -550,7 +552,7 @@ def _apply_price_cap(url: str, alert: dict) -> str:
 # ya supera este % del presupuesto total, no entra. Casas y PH se muestran igual.
 DEPTO_UNKNOWN_EXP_MAX_SHARE = 0.90
 
-def filter_listings(listings: list, alert: dict) -> list:
+def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_DAYS) -> list:
     min_p    = alert.get("min_price", 200000)
     max_r, max_t = _price_limits(alert)
     min_m2   = alert.get("min_m2", 0)
@@ -560,7 +562,7 @@ def filter_listings(listings: list, alert: dict) -> list:
     for l in listings:
         # Date filter: skip listings older than MAX_LISTING_AGE_DAYS
         age = l.get("days_ago")
-        if age is not None and age > MAX_LISTING_AGE_DAYS:
+        if age is not None and age > max_age:
             continue
 
         rent = _parse_price(l["price"])
@@ -1551,34 +1553,20 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
         add_alert(chat_id, alert)
+        ctx.user_data["initial_alert_id"] = alert.get("_id")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📬 Las de la última semana", callback_data="initial_week")],
+            [InlineKeyboardButton("🔔 Solo las nuevas", callback_data="initial_new")],
+        ])
         await update.message.reply_text(
-            f"✅ Alerta guardada: <b>{alert.get('name') or alert.get('summary','')}</b>\n\n"
-            "🔍 Buscando publicaciones de la última semana que coincidan...",
-            parse_mode="HTML"
+            f"✅ Alerta guardada: <b>{html_mod.escape(alert.get('name') or alert.get('summary', ''))}</b>\n\n"
+            "¿Qué publicaciones querés que te mande?\n"
+            "• <b>Última semana</b>: te mando ahora las que se publicaron en los últimos 7 días.\n"
+            "• <b>Solo las nuevas</b>: no te mando nada ahora y te aviso de las que aparezcan de acá en adelante.",
+            parse_mode="HTML",
+            reply_markup=kb,
         )
-        # Immediate scrape for this user
-        tg_app = ctx.application
-        users  = load_users()
-        user   = users.get(chat_id, {})
-        user.setdefault("active", True)
-        count  = await scrape_user(tg_app, chat_id, user)
-        save_users(users)
-        release_memory()
-        if count == 0:
-            await update.message.reply_text(
-                "No encontré publicaciones recientes que coincidan. "
-                "Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo."
-            )
-        else:
-            await update.message.reply_text(
-                f"Te mandé {count} publicación(es) reciente(s) que encontré. "
-                "Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo."
-            )
-        await update.message.reply_text(
-            "💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento."
-        )
-        await update.message.reply_text("¿Querés agregar otra alerta con distintos criterios? (si/no)")
-        return AWAITING_MORE_ALERTS
+        return AWAITING_INITIAL_SEND
 
     if text in ("no", "n"):
         await update.message.reply_text("Contame de nuevo qué estás buscando. Podés ser más específico.")
@@ -1586,6 +1574,44 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Respondé <b>si</b> o <b>no</b>.", parse_mode="HTML")
     return AWAITING_CONFIRMATION
+
+async def handle_initial_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Botones tras guardar una alerta: mandar la última semana o solo las nuevas."""
+    query   = update.callback_query
+    chat_id = str(query.message.chat_id)
+    await query.answer()
+    only_new = query.data == "initial_new"
+    aid      = ctx.user_data.pop("initial_alert_id", None)
+    send     = lambda text: ctx.bot.send_message(query.message.chat_id, text)
+    if not aid:  # botón viejo
+        await query.edit_message_reply_markup(reply_markup=None)
+        return ConversationHandler.END
+    await query.edit_message_text(
+        query.message.text_html.split("\n\n")[0] + "\n\n" +
+        ("🔔 Te aviso solo de las nuevas." if only_new else "📬 Buscando las de la última semana..."),
+        parse_mode="HTML",
+    )
+    users = load_users()
+    user  = users.get(chat_id, {})
+    count = await scrape_user(ctx.application, chat_id, user, only_alert=aid,
+                              silent=only_new, max_age=INITIAL_SEND_DAYS)
+    save_users(users)
+    release_memory()
+    if only_new:
+        await send("Listo. Voy a revisar cada 15 minutos y te aviso apenas aparezca algo nuevo.")
+    elif count == 0:
+        await send("No encontré publicaciones de la última semana que coincidan. "
+                   "Voy a revisar cada 15 minutos y te aviso cuando aparezca algo nuevo.")
+    else:
+        await send(f"Te mandé {count} publicación(es) de la última semana. "
+                   "Voy a revisar cada 15 minutos y te aviso cuando haya algo nuevo.")
+    await send("💡 Podés usar /alertas para ver, editar o borrar tus alertas en cualquier momento.")
+    await send("¿Querés agregar otra alerta con distintos criterios? (si/no)")
+    return AWAITING_MORE_ALERTS
+
+async def handle_initial_send_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Elegí una de las dos opciones de arriba 👆")
+    return AWAITING_INITIAL_SEND
 
 async def handle_more_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text    = update.message.text.lower().strip()
@@ -1603,13 +1629,18 @@ async def handle_more_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ── Scraper job ────────────────────────────────────────────────────────────────
-async def scrape_user(app: Application, chat_id: str, user: dict) -> int:
-    """Scrape all alerts for one user. Returns count of new listings sent."""
+async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: str | None = None,
+                      silent: bool = False, max_age: int = MAX_LISTING_AGE_DAYS) -> int:
+    """Scrape the user's alerts (or only `only_alert`, by _id). Returns how many
+    new listings were sent. With silent=True nothing is sent: every listing
+    currently published is marked as seen, so only future ones are notified."""
     seen  = set(user.get("seen", []))
     total = 0
     loop  = asyncio.get_event_loop()
 
     for alert in get_alerts(user):
+        if only_alert and alert.get("_id") != only_alert:
+            continue
         sources = (
             [("zonaprop",     _apply_price_cap(u, alert)) for u in alert.get("zonaprop_urls", [])]
             + [("argenprop",  u) for u in [argenprop_url(alert, remax_params(alert, user))] if u]
@@ -1626,6 +1657,10 @@ async def scrape_user(app: Application, chat_id: str, user: dict) -> int:
             else:
                 listings = scrape_mercadolibre(url)
 
+            if silent:
+                seen.update(l["id"] for l in listings)
+                continue
+
             detail = DETAIL_EXPENSES.get(scraper_name)
             if detail:
                 # Expensas sin informar en el listado: se revisa la publicación
@@ -1641,7 +1676,7 @@ async def scrape_user(app: Application, chat_id: str, user: dict) -> int:
 
             for l in listings:
                 l.setdefault("tipo", _infer_tipo(l["link"], url or ""))
-            listings = filter_listings(listings, alert)
+            listings = filter_listings(listings, alert, max_age)
             new = [l for l in listings if l["id"] not in seen]
 
             for l in new:
@@ -1802,6 +1837,10 @@ def main():
             AWAITING_PRECIO:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_precio)],
             AWAITING_EXTRAS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wizard_extras)],
             AWAITING_CONFIRMATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirmation)],
+            AWAITING_INITIAL_SEND: [
+                CallbackQueryHandler(handle_initial_send, pattern="^initial_(week|new)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_initial_send_text),
+            ],
             AWAITING_MORE_ALERTS:  [
                 MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_more_alerts),
