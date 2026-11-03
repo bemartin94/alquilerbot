@@ -75,6 +75,9 @@ except OSError:
     pass
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Groq (plan actual) permite 1000 tokens de salida por minuto y reserva max_tokens
+# por adelantado: pedir 4096 hacía fallar cualquier búsqueda.
+GROQ_MAX_TOKENS = 450   # la respuesta (sin URLs) ocupa ~150-250 tokens
 
 # ── Memoria ────────────────────────────────────────────────────────────────────
 # La máquina tiene 256 MB. glibc crea un "arena" de malloc por hilo (los
@@ -764,41 +767,10 @@ def format_listing(l: dict) -> str:
 
 # ── Gemini ─────────────────────────────────────────────────────────────────────
 GEMINI_PROMPT = """
-Sos un asistente de búsqueda de departamentos en Argentina.
-El usuario te describe qué está buscando. Interpretá su pedido y generá las URLs de búsqueda.
-Devolvé SOLO un JSON válido, sin texto adicional ni bloques de código.
-
-## Formato ZonaProp
-https://www.zonaprop.com.ar/{tipos}-alquiler-{barrios}-{ambientes}-{precio}-pesos-orden-publicado-descendente.html
-- tipos: departamentos | casas | ph | casas-departamentos-ph (separados por -)
-- barrios: nombres en minúscula con guiones, separados por - (ej: palermo-villa-crespo)
-- ambientes: desde-1-hasta-3-ambientes (omitir si no se especifica; "2 o más" → desde-2-hasta-5-ambientes)
-- m2: NO incluir el filtro de m² en ZonaProp (solo filtra cubiertos; los m² totales se filtran después)
-- precio: 200000-700000
-
-Barrios CABA: palermo, villa-crespo, colegiales, belgrano, belgrano-r, nunez, saavedra, coghlan, villa-urquiza, villa-pueyrredon, villa-ortuzar, parque-chas, agronomia, la-paternal, chacarita, villa-del-parque, villa-devoto, caballito, boedo, recoleta
-Barrios GBA: florida, vicente-lopez, martinez, olivos, san-isidro
-
-## Formato ArgenProp
-https://www.argenprop.com/{tipo}-alquiler-en-{barrio}--precio-desde-{min}-hasta-{max}
-
-- tipo: departamento | ph | casa
-- barrio: nombre en minúscula con guiones (ej: palermo, villa-crespo, villa-urquiza)
-- precio en ARS
-
-Ejemplo: https://www.argenprop.com/departamento-alquiler-en-palermo--precio-desde-200000-hasta-700000
-
-Barrios CABA para ArgenProp: palermo, villa-crespo, colegiales, belgrano, nunez, saavedra, coghlan, villa-urquiza, villa-pueyrredon, villa-ortuzar, parque-chas, agronomia, la-paternal, chacarita, villa-del-parque, villa-devoto, florida
-
-## Formato MercadoLibre
-https://inmuebles.mercadolibre.com.ar/{tipo}/alquiler/{zona}/{barrios}/_PriceRange_{min}ARS-{max}ARS_NoIndex_True_TOTAL*AREA_{m2}m%C2%B2-*
-- tipo: departamentos | ph | casas
-- zona CABA: capital-federal
-- zona GBA: bsas-gba-norte/vicente-lopez/florida (para Florida)
-- barrios: nombreA-o-nombreB-o-nombreC
-- m2: metros cuadrados mínimos TOTALES (usá 30 si no se especifica)
-
-Barrios CABA para ML: palermo, villa-crespo, colegiales, belgrano-r, nunez, saavedra, coghlan, villa-urquiza, villa-pueyrredon, villa-ortuzar, parque-chas, agronomia, paternal, chacarita, villa-devoto, parque-centenario
+Sos un asistente de búsqueda de alquileres en Buenos Aires (CABA y GBA).
+El usuario te describe qué está buscando. Interpretá su pedido y devolvé los datos de la búsqueda
+(las URLs las arma el sistema, NO las generes).
+Devolvé SOLO un JSON válido y compacto (sin indentación ni saltos de línea), sin texto adicional ni bloques de código.
 
 ## Conversión de precios (MUY IMPORTANTE)
 Primero convertí el precio mencionado a pesos ARS:
@@ -820,21 +792,17 @@ Casos:
 2. "hasta 800k de alquiler" / solo alquiler / sin aclaración:
    → max_rent_price = 800000, max_total_price = 0
 
-3. No especifica precio: NO inventes uno. max_rent_price = 0, max_total_price = 0 y no
-   pongas rango de precio en las URLs (ZonaProp sin el tramo "-{min}-{max}-pesos",
-   MercadoLibre sin "_PriceRange_...", ArgenProp sin "--precio-desde-...").
+3. No especifica precio: NO inventes uno. max_rent_price = 0, max_total_price = 0.
 
-- Las URLs usan max_rent_price en el rango de precio (si es 0, sin rango de precio)
 - min_price es SIEMPRE 200000
 - Si el usuario no especifica tipo, usá departamentos, ph y casas
 - Si no especifica m2 mínimo, usá 30. Los m² son siempre TOTALES (en el summary escribí "m² totales")
 
 ## Zona CABA completa
 Si el usuario dice "CABA", "Capital Federal", "Ciudad de Buenos Aires" sin barrios específicos,
-usá una lista amplia de barrios: palermo, villa-crespo, colegiales, belgrano, nunez, saavedra,
-villa-urquiza, caballito, boedo, recoleta, almagro, flores, floresta, villa-del-parque,
-villa-devoto, chacarita, paternal, parque-centenario, san-telmo, montserrat, puerto-madero
-- Generá una URL de ZonaProp y una de ML por tipo de propiedad
+usá una lista amplia de barrios: Palermo, Villa Crespo, Colegiales, Belgrano, Nuñez, Saavedra,
+Villa Urquiza, Caballito, Boedo, Recoleta, Almagro, Flores, Floresta, Villa Del Parque,
+Villa Devoto, Chacarita, Paternal, San Telmo, Monserrat, Puerto Madero
 
 ## require_keywords
 Si el usuario menciona características que deben estar presentes en la publicación, incluílas en `require_keywords`. El filtro busca que al menos UNA de esas palabras aparezca en la dirección o features del listado en los resultados de búsqueda.
@@ -876,11 +844,8 @@ NO inventes una búsqueda. Devolvé exactamente: {"no_es_busqueda": true}
 
 ## Respuesta (SOLO JSON, nada más):
 {
-  "name": "nombre corto descriptivo de esta alerta (ej: Deptos 2amb Palermo)",
-  "summary": "descripción clara en español de lo que entendiste",
-  "zonaprop_urls": ["url1"],
-  "argenprop_urls": ["url1"],
-  "mercadolibre_urls": ["url1"],
+  "name": "nombre corto (ej: Deptos 2amb Palermo)",
+  "summary": "una oración corta con lo que entendiste",
   "min_price": 200000,
   "max_rent_price": 800000,
   "max_total_price": 800000,
@@ -895,20 +860,112 @@ NO inventes una búsqueda. Devolvé exactamente: {"no_es_busqueda": true}
 }
 `solo_dueno`: true solo si el usuario pide publicaciones de dueño directo / sin inmobiliarias.
 `barrios`: nombres de barrio/localidad tal como se escriben normalmente (con tildes), uno por elemento.
-`tipos`: subconjunto de ["departamento", "ph", "casa"].
+`tipos`: subconjunto de ["departamento", "ph", "casa"]; si no especifica, los tres.
 `min_ambientes`/`max_ambientes`: rango de ambientes pedido (monoambiente = 1); 0 si no se especificó.
 """
+
+# ── URLs de búsqueda (las arma el bot, no Groq) ────────────────────────────────
+def _slug(name: str) -> str:
+    t = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", t.replace(".", ""))).strip("-")
+
+_ZP_SLUG_FIX = {"paternal": "la-paternal", "villa-gral-mitre": "villa-general-mitre"}
+_ML_SLUG_FIX = {"la-paternal": "paternal", "villa-gral-mitre": "villa-general-mitre"}
+# Localidades del mapa (conurbano.geojson) -> (zona de MercadoLibre, partido).
+# Si la localidad es la cabecera del partido, se busca en todo el partido.
+_GBA = {}
+for _zona, _partido, _locs in [
+    ("bsas-gba-norte", "vicente-lopez",      "Florida|Florida Oeste|Munro|Olivos|La Lucila|Vicente López|Villa Martelli"),
+    ("bsas-gba-norte", "san-isidro",         "Martínez|San Isidro|Beccar|Boulogne|Villa Adelina"),
+    ("bsas-gba-norte", "general-san-martin", "General San Martín|Villa Ballester|José León Suárez|San Andrés"),
+    ("bsas-gba-oeste", "tres-de-febrero",    "Caseros|Ciudadela"),
+    ("bsas-gba-oeste", "moron",              "Morón|Castelar|Haedo|El Palomar"),
+    ("bsas-gba-oeste", "hurlingham",         "Hurlingham"),
+    ("bsas-gba-oeste", "la-matanza",         "San Justo|Ramos Mejía|Lomas del Mirador|La Tablada|Villa Luzuriaga|Ciudad Madero"),
+    ("bsas-gba-sur",   "avellaneda",         "Avellaneda|Dock Sud|Gerli|Piñeyro|Crucecita|Sarandí|Villa Domínico|Wilde"),
+    ("bsas-gba-sur",   "lanus",              "Lanús|Lanús Este|Lanús Oeste|Valentín Alsina|Remedios de Escalada|Monte Chingolo"),
+    ("bsas-gba-sur",   "lomas-de-zamora",    "Lomas de Zamora|Banfield|Temperley|Turdera|Ingeniero Budge"),
+    ("bsas-gba-sur",   "quilmes",            "Quilmes|Bernal|Don Bosco"),
+]:
+    for _l in _locs.split("|"):
+        _GBA[_slug(_l)] = (_zona, _partido)
+
+_TIPO_ORDER = (("departamento", "departamentos"), ("ph", "ph"), ("casa", "casas"))
+
+def _fill_from_old_urls(alert: dict):
+    """Alertas viejas: tipos y ambientes estaban solo dentro de la URL de ZonaProp."""
+    zp = " ".join(alert.get("zonaprop_urls") or [])
+    if not alert.get("tipos") and zp:
+        found = [t for t, slug in _TIPO_ORDER if re.search(rf"[/-]{slug}-", zp)]
+        if found:
+            alert["tipos"] = found
+    if not (alert.get("min_ambientes") or alert.get("max_ambientes")):
+        m = re.search(r"desde-(\d+)(?:-hasta-(\d+))?-ambientes", zp)
+        if m:
+            alert["min_ambientes"] = int(m.group(1))
+            alert["max_ambientes"] = int(m.group(2)) if m.group(2) else 0
+
+def _short_name(a: dict) -> str:
+    t = set(a.get("tipos") or [])
+    tipo = ("Deptos/PH/Casas" if t >= {"departamento", "ph", "casa"} or not t else
+            "/".join(x for k, x in (("departamento", "Deptos"), ("ph", "PH"), ("casa", "Casas")) if k in t))
+    lo, hi = a.get("min_ambientes") or 0, a.get("max_ambientes") or 0
+    amb = "" if not (lo or hi) else f" {lo}+amb" if not hi else f" {lo}amb" if lo == hi else f" {lo or 1}-{hi}amb"
+    b = a.get("barrios") or []
+    zona = "/".join(b[:2]) + (f" +{len(b) - 2}" if len(b) > 2 else "")
+    return f"{tipo}{amb} {zona}".strip()
+
+def build_search_urls(alert: dict) -> dict:
+    """URLs de ZonaProp y MercadoLibre a partir de los datos de la alerta."""
+    tipos  = [slug for t, slug in _TIPO_ORDER if t in (alert.get("tipos") or [t for t, _ in _TIPO_ORDER])]
+    slugs  = list(dict.fromkeys(_slug(b) for b in (alert.get("barrios") or []) if b))
+    if not slugs or not tipos:
+        return {}
+    rent_cap = _price_limits(alert)[0]
+    min_p    = alert.get("min_price") or 200000
+    lo, hi   = alert.get("min_ambientes") or 0, alert.get("max_ambientes") or 0
+    m2       = alert.get("min_m2") or 0
+
+    zp = f"https://www.zonaprop.com.ar/{'-'.join(tipos)}-alquiler-" + "-".join(_ZP_SLUG_FIX.get(x, x) for x in slugs)
+    if lo or hi:
+        zp += f"-desde-{max(lo, 1)}-hasta-{hi or 5}-ambientes"
+    if rent_cap:
+        zp += f"-{min_p}-{rent_cap}-pesos"
+    zp += "-orden-publicado-descendente.html"
+
+    caba = [_ML_SLUG_FIX.get(x, x) for x in slugs if x not in _GBA]
+    gba: dict = {}
+    for x in slugs:
+        if x in _GBA:
+            gba.setdefault(_GBA[x], []).append(x)
+    locations = (["capital-federal/" + "-o-".join(caba)] if caba else [])
+    for (zona, partido), locs in gba.items():
+        locations.append(f"{zona}/{partido}" if partido in locs else f"{zona}/{partido}/{'-o-'.join(locs)}")
+    suffix = (f"_PriceRange_{min_p}ARS-{rent_cap}ARS" if rent_cap else "") + "_NoIndex_True" \
+             + (f"_TOTAL*AREA_{int(m2)}m%C2%B2-*" if m2 else "")
+    ml = [f"https://inmuebles.mercadolibre.com.ar/{t}/alquiler/{loc}/{suffix}" for t in tipos for loc in locations]
+    return {"zonaprop_urls": [zp], "mercadolibre_urls": ml}
+
+class GroqRateLimit(Exception):
+    """Límite de tokens por minuto de Groq; `wait` = segundos sugeridos."""
+    def __init__(self, wait: float):
+        super().__init__(f"rate limit, esperar {wait:.1f}s")
+        self.wait = wait
 
 async def _groq_chat(messages: list, **params) -> str:
     """Chat completion contra la API de Groq (compatible OpenAI) usando aiohttp,
     sin el SDK de groq (ahorra ~10 MB de RAM)."""
-    payload = {"model": "qwen/qwen3.8-27b", "messages": messages, **params}
+    payload = {"model": "qwen/qwen3.8-27b", "messages": messages, "reasoning_effort": "none", **params}
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(GROQ_URL, json=payload, headers=headers) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"Groq HTTP {resp.status}: {(await resp.text())[:300]}")
+                body = await resp.text()
+                wait = re.search(r"try again in ([\d.]+)(ms|s)", body)
+                if resp.status == 429 and wait:
+                    raise GroqRateLimit(float(wait.group(1)) / (1000 if wait.group(2) == "ms" else 1))
+                raise RuntimeError(f"Groq HTTP {resp.status}: {body[:300]}")
             data = await resp.json()
     return data["choices"][0]["message"]["content"] or ""
 
@@ -925,13 +982,22 @@ async def interpret_search(description: str, correction: bool = False) -> dict |
                     {"role": "user",   "content": f"Búsqueda del usuario: {description}"},
                 ],
                 temperature=0.2,
-                max_tokens=4096,
+                max_tokens=GROQ_MAX_TOKENS,
             )).strip()
             log.info("Groq raw (attempt %d): %s", attempt + 1, text[:200])
             text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
             text = re.sub(r"^```(?:json)?\s*", "", text.strip())
             text = re.sub(r"\s*```$", "", text)
-            return json.loads(text.strip())
+            result = json.loads(text.strip())
+            if isinstance(result, dict) and not result.get("no_es_busqueda"):
+                result.pop("argenprop_urls", None)
+                result.update(build_search_urls(result))
+            return result
+        except GroqRateLimit as e:
+            log.warning("Groq rate limit (attempt %d): espero %.1fs", attempt + 1, e.wait)
+            if attempt == 0 and e.wait <= 45:
+                await asyncio.sleep(e.wait + 0.5)
+                continue
         except json.JSONDecodeError as e:
             log.error("Groq JSON parse error (attempt %d): %s | text: %s", attempt + 1, e, text[:300])
         except Exception as e:
@@ -1136,6 +1202,20 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("No tenés alertas activas.")
 
+def _describe_alert(a: dict) -> str:
+    """Descripción de la alerta armada con sus datos (siempre al día)."""
+    t = set(a.get("tipos") or [])
+    tipo = ("Departamento, PH o casa" if t >= {"departamento", "ph", "casa"} or not t else
+            " o ".join(x for k, x in (("departamento", "departamento"), ("ph", "PH"), ("casa", "casa")) if k in t))
+    tipo = tipo[:1].upper() + tipo[1:]
+    lo, hi = a.get("min_ambientes") or 0, a.get("max_ambientes") or 0
+    amb = ("" if not (lo or hi) else f" de {lo} o más ambientes" if lo and not hi else
+           f" de {lo} ambiente{'s' if lo > 1 else ''}" if lo == hi else f" de {lo or 1} a {hi} ambientes")
+    barrios = a.get("barrios") or []
+    zona = (" en " + (", ".join(barrios[:-1]) + " o " + barrios[-1] if len(barrios) > 1 else barrios[0])) if barrios else ""
+    extras = a.get("require_keywords") or []
+    return f"{tipo}{amb}{zona}." + (f" Con: {', '.join(extras)}." if extras else "")
+
 def _alert_params_line(a: dict) -> str:
     """Valores reales de la alerta (no dependen del texto que armó Groq)."""
     parts = []
@@ -1199,7 +1279,7 @@ async def cmd_alertas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             shown["max_total_price"] = _price_limits(shown)[1]
             _refresh_alert_text(shown, "max_total_price")
         name    = html_mod.escape(shown.get("name") or shown.get("summary", f"Alerta {i}"))
-        summary = html_mod.escape(_summary_without_params(shown.get("summary", "")))
+        summary = html_mod.escape(_describe_alert(a) if a.get("barrios") else _summary_without_params(shown.get("summary", "")))
         params  = _alert_params_line(a)
         text    = (f"<b>{i}. {name}</b>" + (f"\n{summary}" if summary and summary != name else "")
                    + (f"\n{params}" if params else ""))
@@ -2057,8 +2137,8 @@ _BOT_APP = None  # set in main() before HTTP server starts
 _bg_tasks: set = set()
 
 async def _apply_zone_edit(chat_id: str, aid: str, barrios: list):
-    """Cambia los barrios de una alerta elegidos en el mapa. Groq solo rearma las
-    URLs de búsqueda; precio, m², tipo, ambientes y dueño directo quedan igual."""
+    """Cambia los barrios de una alerta elegidos en el mapa. Las URLs se rearman en
+    el código (sin Groq); precio, m², tipo, ambientes y dueño directo quedan igual."""
     send = lambda text: _BOT_APP.bot.send_message(int(chat_id), text, parse_mode="HTML")
     lista = ", ".join(barrios)
     try:
@@ -2068,29 +2148,11 @@ async def _apply_zone_edit(chat_id: str, aid: str, barrios: list):
         if idx is None or idx < 0:
             await send("⚠️ Esa alerta ya no existe. Usá /alertas para ver las actuales.")
             return
-        old = alerts[idx]
-        await send(f"Perfecto, actualizo los barrios a <b>{html_mod.escape(lista)}</b>...")
-        desc = (f"Misma búsqueda pero SOLO en estos barrios/localidades: {lista}. "
-                f"Búsqueda: {old.get('summary', '')}")
-        result = await interpret_search(desc, correction=True)
-        if not result or result.get("no_es_busqueda"):
-            log.error("Edición de zona falló para %s: %r", aid, result)
-            await send("No pude actualizar los barrios. Probá de nuevo desde /alertas → Editar → Zona.")
-            return
-        users  = load_users()   # recargar: pudo cambiar mientras respondía Groq
-        alerts = get_alerts(users.get(chat_id, {}))
-        idx    = _find_alert_idx(alerts, aid)
-        if idx is None or idx < 0:
-            return
         alert = alerts[idx]
-        for k in ("zonaprop_urls", "argenprop_urls", "mercadolibre_urls", "name", "summary"):
-            if result.get(k):
-                alert[k] = result[k]
+        _fill_from_old_urls(alert)          # conservar tipo/ambientes de alertas viejas
         alert["barrios"] = barrios
-        if alert.get("min_m2"):
-            _refresh_alert_text(alert, "min_m2")
-        if _price_limits(alert)[1]:
-            _refresh_alert_text(alert, "max_total_price")
+        alert.update(build_search_urls(alert))
+        alert["name"] = _short_name(alert)
         save_users(users)
         await send(f"✅ Barrios actualizados: <b>{html_mod.escape(lista)}</b>\n{_alert_params_line(alert)}")
     except Exception as e:
