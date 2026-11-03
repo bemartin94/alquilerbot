@@ -486,7 +486,7 @@ def add_alert(chat_id: str, alert: dict):
             user.pop(k, None)
     alert.setdefault("_id", uuid.uuid4().hex[:8])
     user["alerts"].append(alert)
-    user.setdefault("active", True)
+    user["active"] = True  # crear una alerta reactiva las notificaciones pausadas con /stop
     user.setdefault("seen", [])
     save_users(users)
 
@@ -684,15 +684,45 @@ async def interpret_search(description: str) -> dict | None:
 
 # ── Telegram handlers ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    return await cmd_buscar(update, ctx)
+    chat_id = str(update.effective_chat.id)
+    name    = html_mod.escape(update.effective_user.first_name or "") if update.effective_user else ""
+    hola    = f"¡Hola{', ' + name if name else ''}! 👋"
+    user    = load_users().get(chat_id, {})
+    alerts  = get_alerts(user)
+    if alerts:
+        n  = len(alerts)
+        pl = "s" if n != 1 else ""
+        if user.get("active", True):
+            estado = (f"Tenés <b>{n} alerta{pl}</b> activa{pl} y te sigo avisando "
+                      "cuando aparecen publicaciones nuevas. Podés verlas con /alertas.")
+        else:
+            estado = (f"Tenés <b>{n} alerta{pl}</b>, pero las notificaciones están pausadas. "
+                      "Se reactivan cuando guardes una búsqueda. Podés verlas con /alertas.")
+        await update.message.reply_text(
+            f"{hola} Qué bueno verte de nuevo.\n\n{estado}\n\n"
+            "Si querés, armamos una búsqueda nueva 👇",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            f"{hola} Soy tu asistente para encontrar alquiler en Buenos Aires 🏠\n\n"
+            "Así funciona:\n"
+            "1️⃣ Me contás qué buscás: zona, ambientes, metros y presupuesto.\n"
+            "2️⃣ Reviso ZonaProp, ArgenProp, MercadoLibre y Remax cada 15 minutos.\n"
+            "3️⃣ Te aviso por acá apenas aparece algo que te sirva.\n\n"
+            "Arranquemos 👇",
+            parse_mode="HTML",
+        )
+    return await cmd_buscar(update, ctx, greet=False)
 
 def _map_keyboard():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🗺️ Elegir barrios en el mapa", web_app=WebAppInfo(url=f"{WEB_APP_URL}/map"))
     ]])
 
-async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE, greet: bool = True):
     chat_id = str(update.effective_chat.id)
+    hola    = "Hola! " if greet else ""
     users   = load_users()
     saved   = users.get(chat_id, {}).get("zones", [])
 
@@ -703,19 +733,19 @@ async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🗺️ Cambiar", web_app=WebAppInfo(url=f"{WEB_APP_URL}/map")),
         ]])
         await update.message.reply_text(
-            f"Hola! La última vez buscaste en: <b>{lista}</b>\n\n¿Seguís buscando en esas zonas?",
+            f"{hola}La última vez buscaste en: <b>{lista}</b>\n\n¿Seguís buscando en esas zonas?",
             parse_mode="HTML",
             reply_markup=keyboard,
         )
         return AWAITING_ZONE_CONFIRM
     elif WEB_APP_URL:
         await update.message.reply_text(
-            "Hola! ¿En qué zona de Buenos Aires estás buscando?",
+            f"{hola}¿En qué zona de Buenos Aires estás buscando?",
             reply_markup=_map_keyboard(),
         )
         return AWAITING_ZONE_CONFIRM
     else:
-        await update.message.reply_text("Hola! ¿Qué estás buscando? Contame barrios, tipo, tamaño y precio máximo:")
+        await update.message.reply_text(f"{hola}¿Qué estás buscando? Contame barrios, tipo, tamaño y precio máximo:")
         return AWAITING_DESCRIPTION
 
 async def handle_zone_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
