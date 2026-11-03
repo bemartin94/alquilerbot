@@ -929,36 +929,34 @@ async def fallback_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(REJECT_TEXT)
 
 # ── Rechazo de comandos escritos como texto ───────────────────────────────────
-# Nombres de comando (con o sin "/") que, si aparecen como palabra en el mensaje,
-# indican que no es una búsqueda.
-_CMD_ANYWHERE = {"alertas", "resetseen", "borrartodo", "comandos", "help"}
-# Palabras que, si son la PRIMERA del mensaje, indican un comando/pedido de ayuda.
-_CMD_FIRST_WORD = {
-    "alerta", "alertas", "stop", "estado", "borrar", "editar", "start", "help",
-    "ayuda", "comando", "comandos", "menu", "inicio", "opciones", "pausar",
-    "resetseen", "borrartodo",
+# Dentro de un flujo (/buscar, /editar...) se acepta lenguaje natural; solo se
+# rechaza un mensaje si ENTERO es un comando. Fuera de un flujo, cualquier texto
+# se rechaza (ver receive_description).
+_CMD_WORDS = {
+    "alerta", "alertas", "buscar", "stop", "estado", "borrar", "borrartodo",
+    "editar", "resetseen", "start", "help", "ayuda", "comando", "comandos",
+    "menu", "inicio", "opciones", "pausar",
 }
 # Mensajes completos que son comandos o no son búsquedas (saludos, etc.).
 _NON_SEARCH_MSGS = {
-    "buscar", "busqueda", "nueva alerta", "mis alertas", "ver alertas", "borrar todo",
+    "nueva alerta", "mis alertas", "ver alertas", "ver mis alertas", "borrar todo",
     "hola", "holaa", "buenas", "buen dia", "buenos dias", "buenas tardes",
     "buenas noches", "hey", "hi", "hello", "gracias", "muchas gracias",
-    "chau", "adios", "info", "que hago", "como funciona", "que podes hacer",
+    "chau", "adios", "info",
 }
+_CMD_RE = re.compile(r"(?:%s)(?: \d+)?" % "|".join(sorted(_CMD_WORDS)))
 
 REJECT_TEXT = "Eso no es una búsqueda.\n\n" + COMMANDS_TEXT
 
 def _is_command_like(text: str) -> bool:
-    """True si el mensaje es (o parece) un comando o un saludo, no una búsqueda."""
+    """True si el mensaje entero es un comando (ej: "alertas", "borrar 1", "/stop")
+    o un saludo suelto. Frases en lenguaje natural devuelven False."""
     t = _norm(text)
     if t.startswith("/"):
         return True
     t = re.sub(r"[^\w\s]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
-    if not t or t in _NON_SEARCH_MSGS:
-        return True
-    words = t.split()
-    return words[0] in _CMD_FIRST_WORD or any(w in _CMD_ANYWHERE for w in words)
+    return not t or t in _NON_SEARCH_MSGS or bool(_CMD_RE.fullmatch(t))
 
 async def reject_command_like(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Corre antes que cualquier otro handler: si el texto es un comando, lo
