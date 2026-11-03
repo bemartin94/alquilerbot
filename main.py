@@ -1732,14 +1732,15 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         add_alert(chat_id, alert)
         ctx.user_data["initial_alert_id"] = alert.get("_id")
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📬 Las de la última semana", callback_data="initial_week")],
+            [InlineKeyboardButton("📬 Última semana + las nuevas", callback_data="initial_week")],
             [InlineKeyboardButton("🔔 Solo las nuevas", callback_data="initial_new")],
         ])
         await update.message.reply_text(
             f"✅ Alerta guardada: <b>{html_mod.escape(alert.get('name') or alert.get('summary', ''))}</b>\n\n"
-            "¿Qué publicaciones querés que te mande?\n"
-            "• <b>Última semana</b>: te mando ahora las que se publicaron en los últimos 7 días.\n"
-            "• <b>Solo las nuevas</b>: no te mando nada ahora y te aviso de las que aparezcan de acá en adelante.",
+            "En los dos casos te aviso de cada publicación nueva que aparezca. "
+            "¿Querés además las que ya están publicadas?\n"
+            "• <b>Última semana + las nuevas</b>: ahora te mando las de los últimos 7 días.\n"
+            "• <b>Solo las nuevas</b>: ahora no te mando nada.",
             parse_mode="HTML",
             reply_markup=kb,
         )
