@@ -1084,6 +1084,21 @@ def _refresh_alert_text(alert: dict, field: str):
         name    = re.sub(r"\b\d+(?:[.,]\d+)?\s*[kKM]\b", k, name, count=1)
     alert["name"], alert["summary"] = name, summary
 
+_SUMMARY_M2_RE = re.compile(
+    r",?\s*(?:con\s+)?(?:un\s+)?(?:m[ií]nimo|al\s+menos|de\s+al\s+menos|desde)\s+(?:de\s+)?"
+    r"\d+\s*m(?:2|²)(?:\s*(?:totales|cubiertos|cuadrados))?", re.IGNORECASE)
+_SUMMARY_PRICE_RE = re.compile(
+    r",?\s*(?:y\s+)?(?:con\s+un\s+)?(?:presupuesto\s+)?(?:m[aá]ximo\s+)?(?:de\s+)?hasta\s+(?:\$\s?)?\d[\d.,]*(?:\s*(?:ARS|pesos|k|K|M|mil)\b)*"
+    r"(?:\s+(?:incluyendo|con|en\s+total|de\s+alquiler|sin\s+contar|m[aá]s|\+)[^,.;]*)?", re.IGNORECASE)
+
+def _summary_without_params(summary: str) -> str:
+    """Resumen sin m² ni precio (se muestran aparte en _alert_params_line)."""
+    t = _SUMMARY_PRICE_RE.sub("", _SUMMARY_M2_RE.sub("", summary or ""))
+    t = re.sub(r"\s+([,.;])", r"\1", t)
+    t = re.sub(r",\s*([.;])", r"\1", t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" ,;")
+    return t
+
 async def cmd_alertas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     users   = load_users()
@@ -1104,7 +1119,7 @@ async def cmd_alertas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             shown["max_total_price"] = _price_limits(shown)[1]
             _refresh_alert_text(shown, "max_total_price")
         name    = html_mod.escape(shown.get("name") or shown.get("summary", f"Alerta {i}"))
-        summary = html_mod.escape(shown.get("summary", ""))
+        summary = html_mod.escape(_summary_without_params(shown.get("summary", "")))
         params  = _alert_params_line(a)
         text    = (f"<b>{i}. {name}</b>" + (f"\n{summary}" if summary and summary != name else "")
                    + (f"\n{params}" if params else ""))
