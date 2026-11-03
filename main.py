@@ -7,6 +7,8 @@ Deploy on Fly.io (persistent process).
 """
 
 import asyncio
+import ctypes
+import gc
 import html as html_mod
 import json
 import logging
@@ -17,9 +19,8 @@ import unicodedata
 import uuid
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web as aiohttp_web
-from groq import AsyncGroq
-import requests
 from curl_cffi import requests as cffi_requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
@@ -61,7 +62,22 @@ AWAITING_EDIT_FIELD   = 13
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# ── Memoria ────────────────────────────────────────────────────────────────────
+# La máquina tiene 256 MB. glibc crea un "arena" de malloc por hilo (los
+# run_in_executor usan hilos) y no devuelve al sistema la memoria liberada;
+# limitar arenas y llamar malloc_trim tras cada ciclo evita que el RSS crezca.
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+    _libc.mallopt(-8, 2)  # M_ARENA_MAX = 2
+except OSError:
+    _libc = None
+
+def release_memory():
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
 
 BASE_HEADERS = {
     "User-Agent": (
@@ -276,7 +292,7 @@ def usd_ars_rate() -> int:
     if time.time() - _usd_rate["ts"] < 3600 and _usd_rate["value"]:
         return _usd_rate["value"]
     try:
-        r = requests.get("https://dolarapi.com/v1/dolares/oficial", timeout=10)
+        r = cffi_requests.get("https://dolarapi.com/v1/dolares/oficial", timeout=10)
         _usd_rate.update(value=int(r.json()["venta"]), ts=time.time())
     except Exception as e:
         log.warning("Dollar rate fetch failed: %s", e)
@@ -741,19 +757,31 @@ NO inventes una búsqueda. Devolvé exactamente: {"no_es_busqueda": true}
 `min_ambientes`/`max_ambientes`: rango de ambientes pedido (monoambiente = 1); 0 si no se especificó.
 """
 
+async def _groq_chat(messages: list, **params) -> str:
+    """Chat completion contra la API de Groq (compatible OpenAI) usando aiohttp,
+    sin el SDK de groq (ahorra ~10 MB de RAM)."""
+    payload = {"model": "qwen/qwen3.8-27b", "messages": messages, **params}
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(GROQ_URL, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Groq HTTP {resp.status}: {(await resp.text())[:300]}")
+            data = await resp.json()
+    return data["choices"][0]["message"]["content"] or ""
+
 async def interpret_search(description: str) -> dict | None:
+    text = ""
     for attempt in range(2):
         try:
-            resp = await groq_client.chat.completions.create(
-                model="qwen/qwen3.8-27b",
-                messages=[
+            text = (await _groq_chat(
+                [
                     {"role": "system", "content": GEMINI_PROMPT},
                     {"role": "user",   "content": f"Búsqueda del usuario: {description}"},
                 ],
                 temperature=0.2,
                 max_tokens=4096,
-            )
-            text = resp.choices[0].message.content.strip()
+            )).strip()
             log.info("Groq raw (attempt %d): %s", attempt + 1, text[:200])
             text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
             text = re.sub(r"^```(?:json)?\s*", "", text.strip())
@@ -1493,6 +1521,7 @@ async def handle_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user.setdefault("active", True)
         count  = await scrape_user(tg_app, chat_id, user)
         save_users(users)
+        release_memory()
         if count == 0:
             await update.message.reply_text(
                 "No encontré publicaciones recientes que coincidan. "
@@ -1598,6 +1627,7 @@ async def scrape_all(app: Application):
         changed = True
     if changed:
         save_users(users)
+    release_memory()
     log.info("Scrape cycle done for %d user(s)", len(users))
 
 # ── Main ───────────────────────────────────────────────────────────────────────

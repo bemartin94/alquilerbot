@@ -1,8 +1,6 @@
-requests==2.32.3
 beautifulsoup4==4.12.3
 lxml
 curl_cffi==0.17.0
 python-telegram-bot==21.6
-groq==0.13.1
 apscheduler==3.10.4
 aiohttp==3.10.5
