@@ -376,8 +376,10 @@ def scrape_remax(alert: dict, params: dict) -> list[dict]:
             str(l.get("expensesPrice")) if l.get("expensesPrice") else "",
             f"{l.get('title', '')} {l.get('description', '')}",
         )
-        m2  = l.get("dimensionCovered") or l.get("dimensionTotalBuilt")
-        features = f"{rooms} amb." + (f" · {round(m2)} m² cubiertos" if m2 else "") + f" · {l.get('title', '')}{usd_note}"
+        cov = l.get("dimensionCovered") or 0
+        tot = l.get("dimensionTotalBuilt") or 0
+        m2  = (f" · {round(tot)} m² tot." if tot else "") + (f" · {round(cov)} m² cubiertos" if cov else "")
+        features = f"{rooms} amb.{m2} · {l.get('title', '')}{usd_note}"
         type_id = (l.get("type") or {}).get("id", 0)
         results.append({**_listing(
             f"rx_{l['id']}",
@@ -537,6 +539,25 @@ def _price_limits(alert: dict) -> tuple[int, int]:
         return max_t, max_t
     return (max_r or max_t), 0
 
+_M2 = r"(\d+(?:[.,]\d+)?)\s*m[²2]"
+def _m2_total(features: str) -> tuple[int | None, bool]:
+    """(m² totales, exacto). Totales explícitos ("50 m² tot.") o sin calificar
+    ("50 m²") son exactos; cubiertos + descubiertos/semicubiertos también.
+    Si solo se conocen los cubiertos devuelve (cubiertos, False)."""
+    f = features or ""
+    num = lambda m: int(float(m.group(1).replace(",", ".")))
+    m = re.search(_M2 + r"\s*(?:tot|total)", f, re.IGNORECASE)
+    if m:
+        return num(m), True
+    cub   = re.search(_M2 + r"\s*cub", f, re.IGNORECASE)
+    extra = sum(num(x) for x in re.finditer(_M2 + r"\s*(?:descub|semicub|semi)", f, re.IGNORECASE))
+    if cub:
+        return num(cub) + extra, bool(extra)
+    m = re.search(_M2 + r"(?!\s*(?:cub|descub|semi))", f, re.IGNORECASE)
+    if m:
+        return num(m), True
+    return None, False
+
 def _apply_price_cap(url: str, alert: dict) -> str:
     """Reescribe el precio máximo de una URL de búsqueda guardada con el tope
     actual (las alertas viejas tienen el 80% del presupuesto en la URL)."""
@@ -546,6 +567,16 @@ def _apply_price_cap(url: str, alert: dict) -> str:
     url = re.sub(r"-(\d+)-\d+-pesos", rf"-\g<1>-{cap}-pesos", url)              # ZonaProp
     url = re.sub(r"(_PriceRange_\d+ARS-)\d+(ARS)", rf"\g<1>{cap}\g<2>", url)      # MercadoLibre
     url = re.sub(r"(--precio-desde-\d+-hasta-)\d+", rf"\g<1>{cap}", url)          # ArgenProp
+    return url
+
+def _apply_alert_params(url: str, alert: dict) -> str:
+    """Ajusta una URL guardada a los valores actuales de la alerta: tope de precio
+    y m² mínimos TOTALES. ZonaProp solo filtra por m² cubiertos, así que ese
+    filtro se saca de la URL y se aplica después sobre los totales."""
+    url = _apply_price_cap(url, alert)
+    url = re.sub(r"-mas-\d+-m2-cubiertos", "", url)                                # ZonaProp
+    if alert.get("min_m2"):
+        url = re.sub(r"(TOTAL\*AREA_)\d+(m)", rf"\g<1>{int(alert['min_m2'])}\g<2>", url)  # MercadoLibre
     return url
 
 # Un depto casi siempre tiene expensas: si no están informadas y el alquiler solo
@@ -571,10 +602,13 @@ def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_
         if max_r and rent > max_r:
             continue
 
-        # m2 filter: parse from features text if min_m2 is set
+        # m² mínimos TOTALES. ML en el listado solo muestra cubiertos, pero su
+        # búsqueda ya filtra por superficie total, así que ahí no se descarta.
         if min_m2:
-            m2_match = re.search(r'(\d+)\s*m[²2]', l.get("features", ""), re.IGNORECASE)
-            if m2_match and int(m2_match.group(1)) < min_m2:
+            total_m2, exact = _m2_total(l.get("features", ""))
+            if total_m2 is not None and total_m2 < 10:
+                total_m2 = None  # dato mal cargado ("2 m² cubie."): no descartar por eso
+            if total_m2 is not None and total_m2 < min_m2 and (exact or not l["id"].startswith("ml_")):
                 continue
 
         # Expensas reales; si la publicación no tiene, cuenta solo el alquiler.
@@ -666,11 +700,11 @@ El usuario te describe qué está buscando. Interpretá su pedido y generá las 
 Devolvé SOLO un JSON válido, sin texto adicional ni bloques de código.
 
 ## Formato ZonaProp
-https://www.zonaprop.com.ar/{tipos}-alquiler-{barrios}-{ambientes}-{m2}-{precio}-pesos-orden-publicado-descendente.html
+https://www.zonaprop.com.ar/{tipos}-alquiler-{barrios}-{ambientes}-{precio}-pesos-orden-publicado-descendente.html
 - tipos: departamentos | casas | ph | casas-departamentos-ph (separados por -)
 - barrios: nombres en minúscula con guiones, separados por - (ej: palermo-villa-crespo)
 - ambientes: desde-1-hasta-3-ambientes (omitir si no se especifica)
-- m2: mas-30-m2-cubiertos (omitir si no se especifica)
+- m2: NO incluir el filtro de m² en ZonaProp (solo filtra cubiertos; los m² totales se filtran después)
 - precio: 200000-700000
 
 Barrios CABA: palermo, villa-crespo, colegiales, belgrano, belgrano-r, nunez, saavedra, coghlan, villa-urquiza, villa-pueyrredon, villa-ortuzar, parque-chas, agronomia, la-paternal, chacarita, villa-del-parque, villa-devoto, caballito, boedo, recoleta
@@ -693,7 +727,7 @@ https://inmuebles.mercadolibre.com.ar/{tipo}/alquiler/{zona}/{barrios}/_PriceRan
 - zona CABA: capital-federal
 - zona GBA: bsas-gba-norte/vicente-lopez/florida (para Florida)
 - barrios: nombreA-o-nombreB-o-nombreC
-- m2: metros cuadrados mínimos (usá 30 si no se especifica)
+- m2: metros cuadrados mínimos TOTALES (usá 30 si no se especifica)
 
 Barrios CABA para ML: palermo, villa-crespo, colegiales, belgrano-r, nunez, saavedra, coghlan, villa-urquiza, villa-pueyrredon, villa-ortuzar, parque-chas, agronomia, paternal, chacarita, villa-devoto, parque-centenario
 
@@ -722,7 +756,7 @@ Casos:
 - Las URLs SIEMPRE usan max_rent_price en el rango de precio
 - min_price es SIEMPRE 200000
 - Si el usuario no especifica tipo, usá departamentos, ph y casas
-- Si no especifica m2 mínimo, usá 30
+- Si no especifica m2 mínimo, usá 30. Los m² son siempre TOTALES (en el summary escribí "m² totales")
 
 ## Zona CABA completa
 Si el usuario dice "CABA", "Capital Federal", "Ciudad de Buenos Aires" sin barrios específicos,
@@ -959,12 +993,12 @@ async def _show_edit_menu(send_fn, alert: dict, idx: int):
     name = alert.get("name") or alert.get("summary", f"Alerta {idx+1}")
     lines = [f"✏️ <b>Editando alerta {idx+1}: {name}</b>", ""]
     if alert.get("min_m2"):
-        lines.append(f"📐 Metros mín: {alert['min_m2']} m²")
+        lines.append(f"📐 Metros mín: {alert['min_m2']} m² totales")
     rent_cap, total_cap = _price_limits(alert)
     if total_cap:
-        lines.append(f"💰 Presupuesto máx total: ${total_cap:,}")
+        lines.append(f"💰 Presupuesto máx total: {_fmt_ars(total_cap)}")
     elif rent_cap:
-        lines.append(f"💰 Alquiler máx: ${rent_cap:,}")
+        lines.append(f"💰 Alquiler máx: {_fmt_ars(rent_cap)}")
     if alert.get("require_keywords"):
         lines.append(f"✨ Extras: {', '.join(alert['require_keywords'])}")
     lines.append("\n¿Qué querés cambiar?")
@@ -1024,6 +1058,32 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("No tenés alertas activas.")
 
+def _alert_params_line(a: dict) -> str:
+    """Valores reales de la alerta (no dependen del texto que armó Groq)."""
+    parts = []
+    if a.get("min_m2"):
+        parts.append(f"📐 {a['min_m2']} m² totales mín.")
+    rent_cap, total_cap = _price_limits(a)
+    if total_cap:
+        parts.append(f"💰 hasta {_fmt_ars(total_cap)} total")
+    elif rent_cap:
+        parts.append(f"💰 hasta {_fmt_ars(rent_cap)} de alquiler")
+    return " · ".join(parts)
+
+def _refresh_alert_text(alert: dict, field: str):
+    """Actualiza nombre y resumen tras editar m² o presupuesto."""
+    name, summary = alert.get("name", ""), alert.get("summary", "")
+    if field == "min_m2":
+        v = alert["min_m2"]
+        summary = re.sub(r"\b\d+\s*m(?:2|²)(?:\s*(?:totales|cubiertos))?", f"{v} m² totales", summary, count=1)
+        name    = re.sub(r"\b\d+\s*m(?:2|²)", f"{v}m2", name, count=1)
+    elif field == "max_total_price":
+        v = alert["max_total_price"]
+        k = f"{v / 1_000_000:g}M" if v >= 1_000_000 else f"{v // 1000}k"
+        summary = re.sub(r"(?:\$\s?)?\d{1,3}(?:\.\d{3})+(?:\s*ARS)?", f"{v:,} ARS".replace(",", "."), summary, count=1)
+        name    = re.sub(r"\b\d+(?:[.,]\d+)?\s*[kKM]\b", k, name, count=1)
+    alert["name"], alert["summary"] = name, summary
+
 async def cmd_alertas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     users   = load_users()
@@ -1037,9 +1097,17 @@ async def cmd_alertas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Tus alertas ({status}):", parse_mode="HTML")
     for i, a in enumerate(alerts, 1):
         aid     = a.get("_id") or str(i)  # fallback to position for old alerts without _id
-        name    = a.get("name") or a.get("summary", f"Alerta {i}")
-        summary = a.get("summary", "")
-        text    = f"<b>{i}. {name}</b>" + (f"\n{summary}" if summary and summary != name else "")
+        shown   = dict(a)  # nombre/resumen alineados con los valores reales (alertas viejas)
+        if shown.get("min_m2"):
+            _refresh_alert_text(shown, "min_m2")
+        if _price_limits(shown)[1]:
+            shown["max_total_price"] = _price_limits(shown)[1]
+            _refresh_alert_text(shown, "max_total_price")
+        name    = html_mod.escape(shown.get("name") or shown.get("summary", f"Alerta {i}"))
+        summary = html_mod.escape(shown.get("summary", ""))
+        params  = _alert_params_line(a)
+        text    = (f"<b>{i}. {name}</b>" + (f"\n{summary}" if summary and summary != name else "")
+                   + (f"\n{params}" if params else ""))
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✏️ Editar", callback_data=f"alert_edit:{aid}"),
             InlineKeyboardButton("🗑️ Borrar", callback_data=f"alert_del:{aid}"),
@@ -1183,7 +1251,7 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["editing_idx"] = idx
 
     field_prompts = {
-        "ef_m2":        ("min_m2",           "¿Cuántos m² mínimo?\nEj: <b>35</b>, <b>40</b>"),
+        "ef_m2":        ("min_m2",           "¿Cuántos m² <b>totales</b> mínimo?\nEj: <b>35</b>, <b>40</b>"),
         "ef_precio":    ("max_total_price",   "¿Cuál es el nuevo presupuesto máximo <b>total</b> (alquiler + expensas)?\nEj: <b>800k</b>, <b>1.2M</b>"),
         "ef_extras":    ("require_keywords",  "¿Qué palabras clave necesitás? (separadas por coma, o <b>ninguna</b> para limpiar)\nEj: <b>cochera, balcón</b>"),
         "ef_tipo":      ("_tipo_nlp",         "¿Qué tipo de propiedad?\nEj: <b>departamento</b>, <b>casa</b>, <b>PH</b>, <b>cualquiera</b>"),
@@ -1229,8 +1297,9 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("No entendí el número. Escribí solo el valor, ej: <b>35</b>", parse_mode="HTML")
             return AWAITING_EDIT_FIELD
         alert["min_m2"] = int(m.group())
+        _refresh_alert_text(alert, "min_m2")
         save_users(users)
-        await update.message.reply_text(f"Metros mínimos actualizado a <b>{alert['min_m2']} m²</b>.", parse_mode="HTML")
+        await update.message.reply_text(f"Metros mínimos actualizado a <b>{alert['min_m2']} m² totales</b>.", parse_mode="HTML")
         return ConversationHandler.END
 
     # Price field: max_total_price
@@ -1257,8 +1326,9 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         alert["max_total_price"] = val
         alert["max_rent_price"]  = val
         alert["_expensas_incluidas"] = True
+        _refresh_alert_text(alert, "max_total_price")
         save_users(users)
-        await update.message.reply_text(f"Presupuesto máximo actualizado a <b>${val:,}</b>.", parse_mode="HTML")
+        await update.message.reply_text(f"Presupuesto máximo actualizado a <b>{_fmt_ars(val)}</b>.", parse_mode="HTML")
         return ConversationHandler.END
 
     # Keywords field
@@ -1368,7 +1438,7 @@ async def handle_wizard_tipo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_wizard_ambientes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.setdefault("wizard", {})["ambientes"] = update.message.text.strip()
     await update.message.reply_text(
-        "¿Superficie mínima en m²?\n"
+        "¿Superficie mínima en m² <b>totales</b>?\n"
         "Ej: <b>40</b>, <b>55m2</b> (o escribí <b>no importa</b>)",
         parse_mode="HTML",
     )
@@ -1424,7 +1494,7 @@ async def handle_wizard_extras(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if zones:
         parts.append(f"en {', '.join(zones)}")
     if wizard.get("metros"):
-        parts.append(f"con al menos {wizard['metros']} m2")
+        parts.append(f"con al menos {wizard['metros']} m2 totales")
     if wizard.get("precio_raw"):
         sufijo = " incluyendo expensas" if wizard.get("expensas_incluidas") else " solo de alquiler"
         parts.append(f"hasta {wizard['precio_raw']}{sufijo}")
@@ -1642,9 +1712,9 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
         if only_alert and alert.get("_id") != only_alert:
             continue
         sources = (
-            [("zonaprop",     _apply_price_cap(u, alert)) for u in alert.get("zonaprop_urls", [])]
+            [("zonaprop",     _apply_alert_params(u, alert)) for u in alert.get("zonaprop_urls", [])]
             + [("argenprop",  u) for u in [argenprop_url(alert, remax_params(alert, user))] if u]
-            + [("mercadolibre", _apply_price_cap(u, alert)) for u in alert.get("mercadolibre_urls", [])]
+            + [("mercadolibre", _apply_alert_params(u, alert)) for u in alert.get("mercadolibre_urls", [])]
             + [("remax", None)]
         )
         for scraper_name, url in sources:
