@@ -465,6 +465,8 @@ def argenprop_url(alert: dict, params: dict) -> str | None:
     max_p = _price_limits(alert)[0]
     if max_p:
         parts.append(f"pesos-{alert.get('min_price', 0)}-{max_p}")
+    if alert.get("solo_dueno"):
+        parts.append("dueno-directo")   # filtro "Tipo de anunciante" de ArgenProp
     parts.append("orden-masnuevos")
     return "https://www.argenprop.com/" + "/".join(parts)
 
@@ -1948,6 +1950,10 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
                 listings = scrape_remax(alert, remax_params(alert, user))
             elif scraper_name == "argenprop":
                 listings = scrape_argenprop(url)
+                if "/dueno-directo/" in (url or ""):
+                    for l in listings:
+                        l["owner"] = True   # ya filtrado por ArgenProp
+                    log.info("[ArgenProp] dueño directo: %d listings", len(listings))
             else:
                 listings = scrape_mercadolibre(url)
 
