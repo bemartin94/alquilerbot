@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Elegí los barrios</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, sans-serif; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #000); }
+  #map { height: calc(100vh - 64px); }
+  #footer {
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    background: var(--tg-theme-bg-color, #fff);
+    border-top: 1px solid var(--tg-theme-hint-color, #ccc);
+    gap: 12px;
+  }
+  #label { font-size: 14px; color: var(--tg-theme-hint-color, #888); flex: 1; }
+  #btn {
+    background: var(--tg-theme-button-color, #2481cc);
+    color: var(--tg-theme-button-text-color, #fff);
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #btn:disabled { opacity: 0.5; cursor: default; }
+  .leaflet-tooltip {
+    font-size: 12px; font-weight: 600;
+    background: rgba(0,0,0,0.65); color: #fff;
+    border: none; box-shadow: none; border-radius: 4px;
+    padding: 2px 6px;
+  }
+  .leaflet-tooltip::before { display: none; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="footer">
+  <span id="label">Tocá los barrios que te interesan</span>
+  <button id="btn" disabled onclick="sendZones()">Confirmar</button>
+</div>
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+
+// Zoom 11 to show CABA + primer cordón
+const map = L.map('map', { zoomControl: true }).setView([-34.620, -58.490], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap',
+  maxZoom: 16
+}).addTo(map);
+
+const selected = new Set();
+const layerMap = {};
+
+const STYLE_DEFAULT  = { color: '#3388ff', weight: 1.5, fillOpacity: 0.08, fillColor: '#3388ff' };
+const STYLE_SELECTED = { color: '#e84433', weight: 2,   fillOpacity: 0.4,  fillColor: '#e84433' };
+const STYLE_CONURB   = { color: '#22aa44', weight: 1.5, fillOpacity: 0.08, fillColor: '#22aa44' };
+const STYLE_CONURB_SEL = { color: '#e84433', weight: 2, fillOpacity: 0.4,  fillColor: '#e84433' };
+
+function updateUI() {
+  const n = selected.size;
+  document.getElementById('label').textContent =
+    n === 0 ? 'Tocá los barrios que te interesan'
+            : n === 1 ? '1 zona seleccionada'
+            : `${n} zonas seleccionadas`;
+  document.getElementById('btn').disabled = n === 0;
+}
+
+function addLayer(data, defaultStyle, selectedStyle) {
+  L.geoJSON(data, {
+    style: defaultStyle,
+    onEachFeature(feature, layer) {
+      const name = feature.properties.nombre;
+      layerMap[name] = { layer, defaultStyle, selectedStyle };
+      layer.bindTooltip(name, { permanent: false, direction: 'center' });
+      layer.on('click', () => {
+        if (selected.has(name)) {
+          selected.delete(name);
+          layer.setStyle(defaultStyle);
+        } else {
+          selected.add(name);
+          layer.setStyle(selectedStyle);
+        }
+        updateUI();
+      });
+    }
+  }).addTo(map);
+}
+
+// Load CABA barrios (blue) then conurbano localidades (green)
+Promise.all([
+  fetch('/barrios.geojson').then(r => r.json()),
+  fetch('/conurbano.geojson').then(r => r.json()),
+]).then(([caba, conurb]) => {
+  addLayer(caba,  STYLE_DEFAULT, STYLE_SELECTED);
+  addLayer(conurb, STYLE_CONURB, STYLE_CONURB_SEL);
+});
+
+async function sendZones() {
+  if (selected.size === 0) return;
+  const btn = document.getElementById('btn');
+  btn.disabled = true;
+  btn.textContent = 'Enviando…';
+  const chatId = tg.initDataUnsafe?.user?.id;
+  if (!chatId) { btn.textContent = 'Error'; return; }
+  try {
+    await fetch('/submit-zones', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, barrios: [...selected].sort() }),
+    });
+    tg.close();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Confirmar';
+  }
+}
+</script>
+</body>
+</html>
