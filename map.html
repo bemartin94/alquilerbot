@@ -40,6 +40,9 @@
     padding: 2px 6px;
   }
   .leaflet-tooltip::before { display: none; }
+  /* Sin el recuadro de foco (naranja) que el navegador dibuja al tocar un barrio */
+  .leaflet-interactive:focus, .leaflet-container path:focus, .leaflet-container:focus { outline: none; }
+  .leaflet-container, .leaflet-interactive { -webkit-tap-highlight-color: transparent; }
 </style>
 </head>
 <body>
