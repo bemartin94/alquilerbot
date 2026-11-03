@@ -63,6 +63,14 @@ INITIAL_SEND_DAYS     = 7   # "las de la última semana" al guardar una alerta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+try:  # copia de los logs en el volumen para poder revisarlos (máx ~1.5 MB)
+    from logging.handlers import RotatingFileHandler
+    _fh = RotatingFileHandler(DATA_DIR / "bot.log", maxBytes=500_000, backupCount=2, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(_fh)
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # sin una línea por cada getUpdates
+except OSError:
+    pass
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -575,6 +583,7 @@ def _apply_alert_params(url: str, alert: dict) -> str:
     filtro se saca de la URL y se aplica después sobre los totales."""
     url = _apply_price_cap(url, alert)
     url = re.sub(r"-mas-\d+-m2-cubiertos", "", url)                                # ZonaProp
+    url = re.sub(r"desde-(\d+)-hasta-ambientes", r"desde-\1-hasta-5-ambientes", url)  # ZonaProp "2+"
     if alert.get("min_m2"):
         url = re.sub(r"(TOTAL\*AREA_)\d+(m)", rf"\g<1>{int(alert['min_m2'])}\g<2>", url)  # MercadoLibre
     return url
@@ -703,7 +712,7 @@ Devolvé SOLO un JSON válido, sin texto adicional ni bloques de código.
 https://www.zonaprop.com.ar/{tipos}-alquiler-{barrios}-{ambientes}-{precio}-pesos-orden-publicado-descendente.html
 - tipos: departamentos | casas | ph | casas-departamentos-ph (separados por -)
 - barrios: nombres en minúscula con guiones, separados por - (ej: palermo-villa-crespo)
-- ambientes: desde-1-hasta-3-ambientes (omitir si no se especifica)
+- ambientes: desde-1-hasta-3-ambientes (omitir si no se especifica; "2 o más" → desde-2-hasta-5-ambientes)
 - m2: NO incluir el filtro de m² en ZonaProp (solo filtra cubiertos; los m² totales se filtran después)
 - precio: 200000-700000
 
@@ -841,7 +850,10 @@ async def _groq_chat(messages: list, **params) -> str:
             data = await resp.json()
     return data["choices"][0]["message"]["content"] or ""
 
-async def interpret_search(description: str) -> dict | None:
+async def interpret_search(description: str, correction: bool = False) -> dict | None:
+    if correction:
+        description += ("\n(IMPORTANTE: esto ES una búsqueda de propiedad con una corrección del usuario; "
+                        "devolvé la búsqueda completa corregida, nunca no_es_busqueda)")
     text = ""
     for attempt in range(2):
         try:
@@ -1616,16 +1628,26 @@ async def _receive_description_freetext(update: Update, ctx: ContextTypes.DEFAUL
     previous     = ctx.user_data.pop("correcting", None) and ctx.user_data.get("last_desc")
     if previous:
         # Corrección de la búsqueda anterior: se mantiene todo lo demás.
-        ctx.user_data["last_desc"] = (
+        combined = (
             f"{previous}\nCorrección del usuario (aplicala y mantené todo lo demás igual, "
             f"incluido el precio si no lo cambia): {desc}"
         )
         await update.message.reply_text("Un segundo, estoy aplicando el cambio...")
-        result = await interpret_search(ctx.user_data["last_desc"])
+        result = await interpret_search(combined, correction=True)
+        if result and result.get("no_es_busqueda"):
+            log.warning("Groq devolvió no_es_busqueda para una corrección, reintento: %r", desc)
+            result = await interpret_search(combined, correction=True)
         if result and not result.get("no_es_busqueda"):
+            ctx.user_data["last_desc"] = combined
             _keep_uncorrected(result, ctx.user_data.get("prev_result") or {}, desc)
             return await _show_confirmation(update, ctx, result)
-        await update.message.reply_text("No pude aplicar el cambio. Contame de nuevo qué estás buscando.")
+        log.error("No se pudo aplicar la corrección %r (resultado: %r)", desc, result)
+        ctx.user_data["correcting"] = True   # sigue la búsqueda anterior
+        await update.message.reply_text(
+            "No pude aplicar ese cambio. Probá escribirlo de otra forma; lo demás sigue igual.\n"
+            "Ej: <i>2 ambientes o más</i>, <i>que sea casa o PH</i>, <i>hasta 1M</i>",
+            parse_mode="HTML",
+        )
         return AWAITING_DESCRIPTION
     if len(desc) < 5:
         await update.message.reply_text(
