@@ -711,6 +711,23 @@ def _apply_alert_params(url: str, alert: dict) -> str:
 # ya supera este % del presupuesto total, no entra. Casas y PH se muestran igual.
 DEPTO_UNKNOWN_EXP_MAX_SHARE = 0.90
 
+def _ambientes(features: str) -> int | None:
+    """Cantidad de ambientes según la tarjeta ('2 amb.', '2 ambientes', 'Monoam.', '2 ambs.')."""
+    f = features or ""
+    if re.search(r"monoam|mono\s*ambiente", f, re.IGNORECASE):
+        return 1
+    m = re.search(r"(\d+)\s*amb", f, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+def _min_m2_for(alert: dict, features: str) -> int:
+    """m² mínimos para esta publicación: por cantidad de ambientes si la alerta lo
+    define (min_m2_por_amb = {"1": 40, "2": 34}); si no, el mínimo general."""
+    per = alert.get("min_m2_por_amb") or {}
+    n = _ambientes(features)
+    if n is not None and str(n) in per:
+        return per[str(n)]
+    return alert.get("min_m2", 0) or 0
+
 def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_DAYS) -> list:
     min_p    = alert.get("min_price", 200000)
     max_r, max_t = _price_limits(alert)
@@ -732,6 +749,7 @@ def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_
 
         # m² mínimos TOTALES. ML en el listado solo muestra cubiertos, pero su
         # búsqueda ya filtra por superficie total, así que ahí no se descarta.
+        min_m2 = _min_m2_for(alert, l.get("features", ""))
         if min_m2:
             total_m2, exact = _m2_total(l.get("features", ""))
             if total_m2 is not None and total_m2 < 10:
@@ -1056,7 +1074,7 @@ def build_search_urls(alert: dict) -> dict:
     rent_cap = _price_limits(alert)[0]
     min_p    = alert.get("min_price") or 200000
     lo, hi   = alert.get("min_ambientes") or 0, alert.get("max_ambientes") or 0
-    m2       = alert.get("min_m2") or 0
+    m2       = min([alert.get("min_m2") or 0] + list((alert.get("min_m2_por_amb") or {}).values())) or 0
 
     zp = f"https://www.zonaprop.com.ar/{'-'.join(tipos)}-alquiler-" + "-".join(_ZP_SLUG_FIX.get(x, x) for x in slugs)
     if lo or hi:
@@ -1269,7 +1287,11 @@ async def _show_edit_menu(send_fn, alert: dict, idx: int, chat_id=None):
     aid = alert.get("_id") or str(idx + 1)
     name = alert.get("name") or alert.get("summary", f"Alerta {idx+1}")
     lines = [f"✏️ <b>Editando alerta {idx+1}: {name}</b>", ""]
-    if alert.get("min_m2"):
+    if alert.get("min_m2_por_amb"):
+        per = alert["min_m2_por_amb"]
+        lines.append("📐 Metros mín: " + " · ".join(f"{'mono' if k == '1' else k + ' amb'} {v}+" for k, v in sorted(per.items()))
+                     + f" · resto {alert.get('min_m2', 0)}+ (totales)")
+    elif alert.get("min_m2"):
         lines.append(f"📐 Metros mín: {alert['min_m2']} m² totales")
     rent_cap, total_cap = _price_limits(alert)
     if total_cap:
@@ -1355,7 +1377,11 @@ def _describe_alert(a: dict) -> str:
 def _alert_params_line(a: dict) -> str:
     """Valores reales de la alerta (no dependen del texto que armó Groq)."""
     parts = []
-    if a.get("min_m2"):
+    per = a.get("min_m2_por_amb") or {}
+    if per:
+        txt = " · ".join(f"{'mono' if k == '1' else k + ' amb'}: {v}+ m²" for k, v in sorted(per.items()))
+        parts.append(f"📐 {txt} · resto: {a.get('min_m2', 0)}+ m² (totales)")
+    elif a.get("min_m2"):
         parts.append(f"📐 {a['min_m2']} m² totales o más")
     rent_cap, total_cap = _price_limits(a)
     if total_cap:
@@ -2371,6 +2397,9 @@ def _broadens(before: dict, after: dict) -> bool:
         return True                                            # más ambientes
     if (a.get("min_m2") or 0) < (b.get("min_m2") or 0):
         return True                                            # entran lugares más chicos
+    pb, pa = b.get("min_m2_por_amb") or {}, a.get("min_m2_por_amb") or {}
+    if any(pa.get(k, a.get("min_m2") or 0) < pb.get(k, b.get("min_m2") or 0) for k in set(pa) | set(pb)):
+        return True
     cap = lambda x: [c or 10**12 for c in _price_limits(x)]   # 0 = sin tope
     if any(na > nb for na, nb in zip(cap(a), cap(b))):
         return True                                            # más presupuesto
