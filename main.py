@@ -290,6 +290,11 @@ def fetch(url: str, referer: str) -> BeautifulSoup | None:
     return None
 
 _detail_age: dict = {}   # link -> años de antigüedad (leídos del detalle de ML / Remax)
+# El filtro de antigüedad solo está disponible para estos chats (variable de entorno en Fly).
+ANTIGUEDAD_CHATS = {c.strip() for c in os.environ.get("ANTIGUEDAD_CHATS", "").split(",") if c.strip()}
+
+def _antig_ok(chat_id) -> bool:
+    return str(chat_id) in ANTIGUEDAD_CHATS
 
 def _parse_age(text) -> int | None:
     """'25 años' / '25' -> 25; 'A estrenar' / 'En construcción' -> 0; otra cosa -> None."""
@@ -1250,17 +1255,17 @@ async def handle_alert_del_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     name = removed.get("name") or removed.get("summary", f"Alerta {idx+1}")
     await query.edit_message_text(f"🗑️ <i>Alerta eliminada: {name}</i>", parse_mode="HTML")
 
-def _edit_menu_kb(aid: str) -> InlineKeyboardMarkup:
+def _edit_menu_kb(aid: str, antig: bool = False) -> InlineKeyboardMarkup:
     b = lambda label, key: InlineKeyboardButton(label, callback_data=f"ef_{key}:{aid}")
     return InlineKeyboardMarkup([
         [b("📐 Metros mínimos", "m2"),   b("💰 Presupuesto", "precio")],
         [b("🏢 Tipo propiedad", "tipo"), b("🛏️ Ambientes", "ambientes")],
         [b("📍 Zona", "zona"),           b("✨ Extras / keywords", "extras")],
-        [b("👤 Dueño directo sí/no", "dueno"), b("🏛️ Antigüedad mín.", "antig")],
+        [b("👤 Dueño directo sí/no", "dueno")] + ([b("🏛️ Antigüedad mín.", "antig")] if antig else []),
         [b("❌ Cancelar", "cancel")],
     ])
 
-async def _show_edit_menu(send_fn, alert: dict, idx: int):
+async def _show_edit_menu(send_fn, alert: dict, idx: int, chat_id=None):
     aid = alert.get("_id") or str(idx + 1)
     name = alert.get("name") or alert.get("summary", f"Alerta {idx+1}")
     lines = [f"✏️ <b>Editando alerta {idx+1}: {name}</b>", ""]
@@ -1277,7 +1282,7 @@ async def _show_edit_menu(send_fn, alert: dict, idx: int):
     if alert.get("min_antiguedad"):
         lines.append(f"🏛️ Deptos de {alert['min_antiguedad']}+ años")
     lines.append("\n¿Qué querés cambiar?")
-    await send_fn("\n".join(lines), parse_mode="HTML", reply_markup=_edit_menu_kb(aid))
+    await send_fn("\n".join(lines), parse_mode="HTML", reply_markup=_edit_menu_kb(aid, _antig_ok(chat_id)))
 
 async def handle_alert_edit_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle inline ✏️ Editar button from /alertas — entry point into ConversationHandler."""
@@ -1299,7 +1304,7 @@ async def handle_alert_edit_button(update: Update, ctx: ContextTypes.DEFAULT_TYP
     # Mensaje nuevo al final del chat: la tarjeta de la alerta en la lista queda igual.
     await _show_edit_menu(
         lambda text, **kw: ctx.bot.send_message(query.message.chat_id, text, **kw),
-        alerts[idx], idx,
+        alerts[idx], idx, query.message.chat_id,
     )
     return AWAITING_EDIT_CHOICE
 
@@ -1536,7 +1541,7 @@ async def cmd_editar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No existe la alerta {idx+1}. Usá /alertas para ver las disponibles.")
         return
     ctx.user_data["editing_idx"] = idx
-    await _show_edit_menu(update.message.reply_text, alerts[idx], idx)
+    await _show_edit_menu(update.message.reply_text, alerts[idx], idx, update.effective_chat.id)
     return AWAITING_EDIT_CHOICE
 
 async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1584,7 +1589,7 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                               "Ej: <b>20</b> (o <b>0</b> para no filtrar). Los que no la informan se muestran igual."),
         "ef_zona":      ("_zona_nlp",         "¿En qué zona o barrios querés buscar?\nEj: <b>Palermo, Villa Crespo</b>, <b>zona norte GBA</b>"),
     }
-    if data not in field_prompts:
+    if data not in field_prompts or (data == "ef_antig" and not _antig_ok(chat_id)):
         return ConversationHandler.END
 
     if data == "ef_zona" and WEB_APP_URL:
@@ -1864,8 +1869,9 @@ async def handle_wizard_dueno(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("👤 Solo dueño directo" if solo else "🤝 Dueño directo o inmobiliaria")
     await query.message.reply_text(
         "¿Necesitás algo especial?\n"
-        "Ej: <b>cochera</b>, <b>balcón</b>, <b>luminoso</b>, <b>terraza</b>, <b>edificio de más de 20 años</b> "
-        "(o escribí <b>no</b> si no hay nada más)",
+        "Ej: <b>cochera</b>, <b>balcón</b>, <b>luminoso</b>, <b>terraza</b>"
+        + (", <b>edificio de más de 5 años</b>" if _antig_ok(query.message.chat_id) else "") +
+        " (o escribí <b>no</b> si no hay nada más)",
         parse_mode="HTML",
     )
     return AWAITING_EXTRAS
@@ -1924,6 +1930,8 @@ async def handle_wizard_extras(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, result: dict):
     """Save pending result and show confirmation with price note."""
+    if not _antig_ok(update.effective_chat.id):
+        result.pop("min_antiguedad", None)       # opción disponible solo para algunos chats
     ctx.user_data["pending"] = result
     rent_cap, total_cap = _price_limits(result)
     fmt = lambda v: f"${v:,.0f}".replace(",", ".")
