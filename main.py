@@ -305,7 +305,7 @@ def _parse_age(text) -> int | None:
     return int(m.group(1)) if m and int(m.group(1)) < 200 else None
 
 def _zonaprop_ages(soup) -> dict:
-    """postingId -> antigüedad (campo 'Antigüedad' del JSON de la página)."""
+    """postingId -> {"age": antigüedad, "cub": m² cubiertos} (JSON de la página)."""
     script = soup.find("script", string=re.compile(r"__PRELOADED_STATE__"))
     try:
         src = script.string
@@ -315,9 +315,13 @@ def _zonaprop_ages(soup) -> dict:
         return {}
     out = {}
     for p in posts:
+        info = out.setdefault(str(p.get("postingId")), {"age": None, "cub": None})
         for f in (p.get("mainFeatures") or {}).values():
-            if "antig" in str(f.get("label", "")).lower():
-                out[str(p.get("postingId"))] = _parse_age(f.get("value"))
+            label = str(f.get("label", "")).lower()
+            if "antig" in label:
+                info["age"] = _parse_age(f.get("value"))
+            elif "superficie cubierta" in label and str(f.get("value", "")).replace(".", "").isdigit():
+                info["cub"] = int(float(f.get("value")))
     return out
 
 def _zonaprop_owner_flags(soup) -> dict:
@@ -362,7 +366,8 @@ def scrape_zonaprop(url: str) -> list[dict]:
             link = f"https://www.zonaprop.com.ar/propiedades/clasificado/{listing_id}.html"
         l = _listing(f"zp_{listing_id}", address, price, expenses, features, link, _days_ago(pub_text), exp_note)
         l["owner"] = owners.get(listing_id) or _owner_from_text(card.get_text(" ", strip=True))
-        l["age"]   = ages.get(listing_id)
+        l["age"]    = (ages.get(listing_id) or {}).get("age")
+        l["m2_cub"] = (ages.get(listing_id) or {}).get("cub")
         results.append(l)
     log.info("[ZonaProp] %d listings", len(results))
     return results
@@ -711,6 +716,13 @@ def _apply_alert_params(url: str, alert: dict) -> str:
 # ya supera este % del presupuesto total, no entra. Casas y PH se muestran igual.
 DEPTO_UNKNOWN_EXP_MAX_SHARE = 0.90
 
+def _m2_cubiertos(l: dict) -> int | None:
+    """m² cubiertos: campo de ZonaProp o 'N m² cub…' de la tarjeta."""
+    if l.get("m2_cub"):
+        return l["m2_cub"]
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*m[²2]\s*cub", l.get("features", "") or "", re.IGNORECASE)
+    return int(float(m.group(1).replace(",", "."))) if m else None
+
 def _ambientes(features: str) -> int | None:
     """Cantidad de ambientes según la tarjeta ('2 amb.', '2 ambientes', 'Monoam.', '2 ambs.')."""
     f = features or ""
@@ -765,6 +777,13 @@ def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_
             if total_m2 is not None and total_m2 < 10:
                 total_m2 = None  # dato mal cargado ("2 m² cubie."): no descartar por eso
             if total_m2 is not None and total_m2 < min_m2 and (exact or not l["id"].startswith("ml_")):
+                continue
+
+        # m² cubiertos mínimos (si la publicación no los informa, entra igual).
+        min_cub = alert.get("min_m2_cubiertos") or 0
+        if min_cub:
+            cub = _m2_cubiertos(l)
+            if cub is not None and cub >= 10 and cub < min_cub:
                 continue
 
         # Expensas reales; si la publicación no tiene, cuenta solo el alquiler.
@@ -1303,6 +1322,8 @@ async def _show_edit_menu(send_fn, alert: dict, idx: int, chat_id=None):
                      + f" · resto {alert.get('min_m2', 0)}+ (totales)")
     elif alert.get("min_m2"):
         lines.append(f"📐 Metros mín: {alert['min_m2']} m² totales")
+    if alert.get("min_m2_cubiertos"):
+        lines.append(f"🏠 Cubiertos mín: {alert['min_m2_cubiertos']} m²")
     rent_cap, total_cap = _price_limits(alert)
     if total_cap:
         lines.append(f"💰 Presupuesto máx total: {_fmt_ars(total_cap)}")
@@ -1393,6 +1414,8 @@ def _alert_params_line(a: dict) -> str:
         parts.append(f"📐 {txt} · resto: {a.get('min_m2', 0)}+ m² (totales)")
     elif a.get("min_m2"):
         parts.append(f"📐 {a['min_m2']} m² totales o más")
+    if a.get("min_m2_cubiertos"):
+        parts.append(f"🏠 {a['min_m2_cubiertos']}+ m² cubiertos")
     rent_cap, total_cap = _price_limits(a)
     for k, v in sorted((a.get("max_total_por_amb") or {}).items()):
         parts.append(f"💰 {'mono' if k == '1' else k + ' amb'}: hasta {_fmt_ars(v)}")
@@ -2409,6 +2432,8 @@ def _broadens(before: dict, after: dict) -> bool:
         return True                                            # más ambientes
     if (a.get("min_m2") or 0) < (b.get("min_m2") or 0):
         return True                                            # entran lugares más chicos
+    if (a.get("min_m2_cubiertos") or 0) < (b.get("min_m2_cubiertos") or 0):
+        return True
     pb, pa = b.get("min_m2_por_amb") or {}, a.get("min_m2_por_amb") or {}
     if any(pa.get(k, a.get("min_m2") or 0) < pb.get(k, b.get("min_m2") or 0) for k in set(pa) | set(pb)):
         return True
