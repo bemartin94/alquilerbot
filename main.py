@@ -289,6 +289,32 @@ def fetch(url: str, referer: str) -> BeautifulSoup | None:
     _fetch_failures.add(url)
     return None
 
+_detail_age: dict = {}   # link -> años de antigüedad (leídos del detalle de ML / Remax)
+
+def _parse_age(text) -> int | None:
+    """'25 años' / '25' -> 25; 'A estrenar' / 'En construcción' -> 0; otra cosa -> None."""
+    t = str(text or "").lower()
+    if re.search(r"estrenar|en construcci|en pozo", t):
+        return 0
+    m = re.search(r"(\d{1,3})", t)
+    return int(m.group(1)) if m and int(m.group(1)) < 200 else None
+
+def _zonaprop_ages(soup) -> dict:
+    """postingId -> antigüedad (campo 'Antigüedad' del JSON de la página)."""
+    script = soup.find("script", string=re.compile(r"__PRELOADED_STATE__"))
+    try:
+        src = script.string
+        state, _ = json.JSONDecoder().raw_decode(src, re.search(r"__PRELOADED_STATE__\s*=\s*", src).end())
+        posts = state["listStore"]["listPostings"]
+    except Exception:
+        return {}
+    out = {}
+    for p in posts:
+        for f in (p.get("mainFeatures") or {}).values():
+            if "antig" in str(f.get("label", "")).lower():
+                out[str(p.get("postingId"))] = _parse_age(f.get("value"))
+    return out
+
 def _zonaprop_owner_flags(soup) -> dict:
     """postingId -> True si ZonaProp lo marca como "Dueño directo"."""
     script = soup.find("script", string=re.compile(r"__PRELOADED_STATE__"))
@@ -310,6 +336,7 @@ def scrape_zonaprop(url: str) -> list[dict]:
     if not soup:
         return []
     owners  = _zonaprop_owner_flags(soup)
+    ages    = _zonaprop_ages(soup)
     results = []
     for card in soup.select("div[data-id]"):
         listing_id = card.get("data-id", "").strip()
@@ -330,6 +357,7 @@ def scrape_zonaprop(url: str) -> list[dict]:
             link = f"https://www.zonaprop.com.ar/propiedades/clasificado/{listing_id}.html"
         l = _listing(f"zp_{listing_id}", address, price, expenses, features, link, _days_ago(pub_text), exp_note)
         l["owner"] = owners.get(listing_id) or _owner_from_text(card.get_text(" ", strip=True))
+        l["age"]   = ages.get(listing_id)
         results.append(l)
     log.info("[ZonaProp] %d listings", len(results))
     return results
@@ -538,6 +566,8 @@ def _parse_argenprop_cards(cards) -> list[dict]:
         pub_text = _text(card, "[class*='date'], [class*='time'], [class*='fecha'], [class*='publicad']")
         l = _listing(f"ap_{uid}", address, price, expenses, features, href, _days_ago(pub_text), exp_note)
         l["owner"] = _argenprop_owner(_text(card, ".card__agent-name"), card.get_text(" ", strip=True))
+        m_age = re.search(r"(\d{1,3})\s*años|a estrenar", features, re.IGNORECASE)
+        l["age"] = _parse_age(m_age.group(0)) if m_age else None
         results.append(l)
     return results
 
@@ -551,9 +581,10 @@ def fetch_ml_expenses(url: str) -> tuple[str, str] | None:
     for row in soup.select("tr"):
         header = row.select_one("th")
         value  = row.select_one("td")
-        if header and value and "expensa" in header.get_text(strip=True).lower():
+        if header and value and "antig" in header.get_text(strip=True).lower():
+            _detail_age[url] = _parse_age(value.get_text(strip=True))
+        if header and value and "expensa" in header.get_text(strip=True).lower() and not table_val:
             table_val = _clean(value.get_text(strip=True))
-            break
     desc = soup.select_one("p.ui-pdp-description__content")
     desc = desc.get_text(" ", strip=True) if desc else ""
     seller = soup.find(string=re.compile(r'"seller_type"\s*:'))
@@ -578,6 +609,9 @@ def fetch_remax_expenses(link: str) -> tuple[str, str] | None:
     except Exception as e:
         log.warning("[Remax] detalle %s: %s", slug, e)
         return None
+    yb = data.get("yearBuilt")
+    if yb and str(yb).isdigit() and 1800 < int(yb) <= datetime.date.today().year:
+        _detail_age[link] = datetime.date.today().year - int(yb)
     exp = data.get("expensesPrice")
     return _expenses_info(str(int(exp)) if exp else "", f"{data.get('title', '')} {data.get('description', '')}")
 
@@ -706,6 +740,10 @@ def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_
                 and not l.get("expenses_note") and rent > max_t * DEPTO_UNKNOWN_EXP_MAX_SHARE):
             continue  # depto en el límite con expensas no informadas
         if max_t and total > max_t:
+            continue
+        # Antigüedad mínima (solo deptos). Si la publicación no la informa, entra igual.
+        min_age = alert.get("min_antiguedad") or 0
+        if min_age and l.get("tipo") == "Depto" and l.get("age") is not None and l["age"] < min_age:
             continue
         # Solo dueño directo (excluyente): si no está confirmado, no entra.
         if alert.get("solo_dueno") and l.get("owner") is not True:
@@ -905,9 +943,11 @@ NO inventes una búsqueda. Devolvé exactamente: {"no_es_busqueda": true}
   "max_ambientes": 3,
   "require_keywords": [],
   "exclude_keywords": [],
-  "solo_dueno": false
+  "solo_dueno": false,
+  "min_antiguedad": 0
 }
 `solo_dueno`: true solo si el usuario pide publicaciones de dueño directo / sin inmobiliarias.
+`min_antiguedad`: años mínimos de antigüedad del edificio si el usuario lo pide ("más de 20 años", "edificio antiguo de al menos 30 años"); 0 si no.
 `barrios`: nombres de barrio/localidad tal como se escriben normalmente (con tildes), uno por elemento.
 `tipos`: subconjunto de ["departamento", "ph", "casa"]; si no especifica, los tres.
 `min_ambientes`/`max_ambientes`: rango de ambientes pedido (monoambiente = 1); 0 si no se especificó.
@@ -1216,7 +1256,7 @@ def _edit_menu_kb(aid: str) -> InlineKeyboardMarkup:
         [b("📐 Metros mínimos", "m2"),   b("💰 Presupuesto", "precio")],
         [b("🏢 Tipo propiedad", "tipo"), b("🛏️ Ambientes", "ambientes")],
         [b("📍 Zona", "zona"),           b("✨ Extras / keywords", "extras")],
-        [b("👤 Dueño directo sí/no", "dueno")],
+        [b("👤 Dueño directo sí/no", "dueno"), b("🏛️ Antigüedad mín.", "antig")],
         [b("❌ Cancelar", "cancel")],
     ])
 
@@ -1234,6 +1274,8 @@ async def _show_edit_menu(send_fn, alert: dict, idx: int):
     if alert.get("require_keywords"):
         lines.append(f"✨ Extras: {', '.join(alert['require_keywords'])}")
     lines.append("👤 Solo dueño directo" if alert.get("solo_dueno") else "🤝 Dueños e inmobiliarias")
+    if alert.get("min_antiguedad"):
+        lines.append(f"🏛️ Deptos de {alert['min_antiguedad']}+ años")
     lines.append("\n¿Qué querés cambiar?")
     await send_fn("\n".join(lines), parse_mode="HTML", reply_markup=_edit_menu_kb(aid))
 
@@ -1317,6 +1359,8 @@ def _alert_params_line(a: dict) -> str:
         parts.append(f"💰 hasta {_fmt_ars(rent_cap)} de alquiler")
     if a.get("solo_dueno"):
         parts.append("👤 solo dueño directo")
+    if a.get("min_antiguedad"):
+        parts.append(f"🏛️ deptos de {a['min_antiguedad']}+ años")
     return " · ".join(parts)
 
 def _refresh_alert_text(alert: dict, field: str):
@@ -1536,6 +1580,8 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "ef_extras":    ("require_keywords",  "¿Qué palabras clave necesitás? (separadas por coma, o <b>ninguna</b> para limpiar)\nEj: <b>cochera, balcón</b>"),
         "ef_tipo":      ("_tipo_nlp",         "¿Qué tipo de propiedad?\nEj: <b>departamento</b>, <b>casa</b>, <b>PH</b>, <b>cualquiera</b>"),
         "ef_ambientes": ("_ambientes_nlp",    "¿Cuántos ambientes?\nEj: <b>2</b>, <b>2 a 3</b>, <b>3+</b>, <b>monoambiente</b>"),
+        "ef_antig":     ("min_antiguedad",    "¿Cuántos años de antigüedad mínima para los <b>deptos</b>?\n"
+                                              "Ej: <b>20</b> (o <b>0</b> para no filtrar). Los que no la informan se muestran igual."),
         "ef_zona":      ("_zona_nlp",         "¿En qué zona o barrios querés buscar?\nEj: <b>Palermo, Villa Crespo</b>, <b>zona norte GBA</b>"),
     }
     if data not in field_prompts:
@@ -1564,7 +1610,7 @@ async def handle_edit_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     field, prompt = field_prompts[data]
     ctx.user_data["edit_field"] = field
-    labels = {"ef_m2": "Metros mínimos", "ef_precio": "Presupuesto", "ef_extras": "Extras",
+    labels = {"ef_m2": "Metros mínimos", "ef_precio": "Presupuesto", "ef_extras": "Extras", "ef_antig": "Antigüedad mínima",
               "ef_tipo": "Tipo de propiedad", "ef_ambientes": "Ambientes", "ef_zona": "Zona"}
     name = alerts[idx].get("name") or alerts[idx].get("summary", f"Alerta {idx+1}")
     # El menú queda como resumen (sin botones) y la pregunta va al final del chat.
@@ -1636,6 +1682,19 @@ async def handle_edit_field_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     # Keywords field
+    if field == "min_antiguedad":
+        m = re.search(r"\d+", text)
+        if not m:
+            await update.message.reply_text("Escribí solo el número de años, ej: <b>20</b> (o <b>0</b>).", parse_mode="HTML")
+            return AWAITING_EDIT_FIELD
+        alert["min_antiguedad"] = int(m.group())
+        save_users(users)
+        await update.message.reply_text(
+            f"Antigüedad mínima de los deptos: <b>{alert['min_antiguedad']} años</b>." if alert["min_antiguedad"]
+            else "Listo, ya no filtro por antigüedad.", parse_mode="HTML")
+        await ask_resend(ctx.bot, chat_id, alert.get("_id"), before, alert)
+        return ConversationHandler.END
+
     if field == "require_keywords":
         if text.lower() in ("ninguna", "ninguno", "no", "-", "nada"):
             alert["require_keywords"] = []
@@ -1805,7 +1864,7 @@ async def handle_wizard_dueno(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("👤 Solo dueño directo" if solo else "🤝 Dueño directo o inmobiliaria")
     await query.message.reply_text(
         "¿Necesitás algo especial?\n"
-        "Ej: <b>cochera</b>, <b>balcón</b>, <b>luminoso</b>, <b>terraza</b> "
+        "Ej: <b>cochera</b>, <b>balcón</b>, <b>luminoso</b>, <b>terraza</b>, <b>edificio de más de 20 años</b> "
         "(o escribí <b>no</b> si no hay nada más)",
         parse_mode="HTML",
     )
@@ -1879,6 +1938,8 @@ async def _show_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE, res
         msg += f"📐 Superficie: {result['min_m2']} m² totales o más\n"
     if price_note:
         msg += f"{price_note}\n"
+    if result.get("min_antiguedad"):
+        msg += f"🏛️ Deptos con al menos {result['min_antiguedad']} años de antigüedad (si lo informan)\n"
     if result.get("solo_dueno"):
         msg += "👤 Solo dueño directo\n"
     msg += "\n¿Confirmás?"
@@ -2010,6 +2071,8 @@ def _keep_uncorrected(result: dict, prev: dict, correction: str, total_default: 
                 result.pop(k, None)
         if _price_limits(result)[1]:
             _refresh_alert_text(result, "max_total_price")
+    if prev.get("min_antiguedad") and not re.search(r"antig|años|nuevo|estrenar", correction, re.IGNORECASE):
+        result["min_antiguedad"] = prev["min_antiguedad"]
     if "solo_dueno" in prev:
         if re.search(r"due[ñn]o|particular", correction, re.IGNORECASE):
             result["solo_dueno"] = not re.search(r"\bno\b|indistinto|cualquiera|tambi[eé]n\s+inmobiliaria", correction, re.IGNORECASE)
@@ -2305,6 +2368,8 @@ def _broadens(before: dict, after: dict) -> bool:
         return True                                            # más presupuesto
     if b.get("solo_dueno") and not a.get("solo_dueno"):
         return True                                            # ahora también inmobiliarias
+    if (a.get("min_antiguedad") or 0) < (b.get("min_antiguedad") or 0):
+        return True                                            # menos exigente con la antigüedad
     kb, ka = set(b.get("require_keywords") or []), set(a.get("require_keywords") or [])
     if kb and (not ka or ka - kb):
         return True                                            # extras menos exigentes
@@ -2527,13 +2592,17 @@ async def scrape_user(app: Application, chat_id: str, user: dict, only_alert: st
                 for l in listings:
                     if l["id"] in seen or (rent_cap and _parse_price(l["price"]) > rent_cap):
                         continue
-                    if (l["expenses"] or l.get("expenses_note")) and not need_owner:
+                    is_depto = (l.get("tipo") or _infer_tipo(l["link"], url or "")) == "Depto"
+                    need_age = bool(alert.get("min_antiguedad")) and is_depto and l.get("age") is None
+                    if (l["expenses"] or l.get("expenses_note")) and not need_owner and not need_age:
                         continue
                     info = await _run_blocking(lambda link=l["link"], f=detail: f(link))
                     if info and not (l["expenses"] or l.get("expenses_note")):
                         l["expenses"], l["expenses_note"] = info
                     if scraper_name == "mercadolibre":
                         l["owner"] = _ml_owner_cache.pop(l["link"], None)
+                    if l["link"] in _detail_age:
+                        l["age"] = _detail_age.pop(l["link"])
 
             for l in listings:
                 l.setdefault("tipo", _infer_tipo(l["link"], url or ""))
