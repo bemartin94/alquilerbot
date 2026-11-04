@@ -765,6 +765,25 @@ def _infer_tipo(link: str, source_url: str = "") -> str:
             return _TIPO_CODES[m.group(1)]
     return ""
 
+def _price_per_m2(l: dict) -> float | None:
+    """Precio total (alquiler + expensas informadas) por m² (totales si se conocen)."""
+    total = _parse_price(l["price"]) + _parse_price(l["expenses"])
+    m2 = _m2_total(l.get("features", ""))[0]
+    if not total or not m2 or m2 < 10:
+        return None
+    return total / m2
+
+def _sort_by_m2_price(listings: list) -> list:
+    """Del más barato al más caro por m²; sin metros, al final por precio total."""
+    def key(l):
+        ppm = _price_per_m2(l)
+        return (ppm is None, ppm if ppm is not None else _parse_price(l["price"]) + _parse_price(l["expenses"]))
+    return sorted(listings, key=key)
+
+def _ppm_text(l: dict) -> str:
+    ppm = _price_per_m2(l)
+    return f" · ≈ {_fmt_ars(round(ppm / 100) * 100)}/m²" if ppm else ""
+
 def _compact_listing(l: dict) -> str:
     """Una línea por publicación para las listas largas."""
     rent, exp = _parse_price(l["price"]), _parse_price(l["expenses"])
@@ -773,7 +792,7 @@ def _compact_listing(l: dict) -> str:
     m2 = _m2_total(l.get("features", ""))[0]
     tipo = l.get("tipo", "")
     return (f"{TIPO_ICON.get(tipo, '🏠')} <b>{html_mod.escape(l['address'][:60])}</b>\n"
-            f"{html_mod.escape(precio)}" + (f" · {m2} m²" if m2 else "") + f' · <a href="{l["link"]}">Ver</a>')
+            f"{html_mod.escape(precio)}" + (f" · {m2} m²" if m2 else "") + _ppm_text(l) + f' · <a href="{l["link"]}">Ver</a>')
 
 def format_listing(l: dict) -> str:
     rent     = _parse_price(l["price"])
@@ -790,7 +809,7 @@ def format_listing(l: dict) -> str:
     header = f"{TIPO_ICON[tipo]} {tipo} · " if tipo in TIPO_ICON else ""
     return (
         f"{header}<b>{l['address']}</b>\n"
-        f"{price_line}\n"
+        f"{price_line}{_ppm_text(l)}\n"
         f"{l['features']}\n"
         f'<a href="{l["link"]}">Ver publicación</a>'
     )
@@ -2167,7 +2186,8 @@ def _page_view(token: str, entry: dict, page: int):
 
 async def present_listings(app: Application, chat_id: str, listings: list, title: str = "") -> None:
     """Hasta INITIAL_CARDS: tarjetas sueltas (con foto). Más: un solo mensaje paginado
-    (◀️ ▶️ editan el mismo mensaje)."""
+    (◀️ ▶️ editan el mismo mensaje). Orden: más barato por m² primero."""
+    listings = _sort_by_m2_price(listings)
     for l in listings:
         log.info("Enviado a %s | alerta %r | %s %s | %s", chat_id[-4:], l.get("_alert"), l.get("tipo", ""),
                  l["id"], l.get("address", "")[:50])
