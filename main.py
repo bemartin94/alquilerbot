@@ -730,7 +730,8 @@ def _min_m2_for(alert: dict, features: str) -> int:
 
 def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_DAYS) -> list:
     min_p    = alert.get("min_price", 200000)
-    max_r, max_t = _price_limits(alert)
+    base_r, base_t = _price_limits(alert)
+    price_per_amb  = alert.get("max_total_por_amb") or {}   # p. ej. {"1": 750000}
     min_m2   = alert.get("min_m2", 0)
     required = [kw.lower() for kw in alert.get("require_keywords", [])]
     excluded = [kw.lower() for kw in alert.get("exclude_keywords", [])]
@@ -740,6 +741,15 @@ def filter_listings(listings: list, alert: dict, max_age: int = MAX_LISTING_AGE_
         age = l.get("days_ago")
         if age is not None and age > max_age:
             continue
+
+        # Tope de precio: por cantidad de ambientes si la alerta lo define.
+        max_r, max_t = base_r, base_t
+        n_amb = _ambientes(l.get("features", "")) if price_per_amb else None
+        if n_amb is not None and str(n_amb) in price_per_amb:
+            cap = price_per_amb[str(n_amb)]
+            max_r = min(max_r, cap) if max_r else cap
+            if max_t:
+                max_t = min(max_t, cap)
 
         rent = _parse_price(l["price"])
         if rent < min_p:
@@ -1384,8 +1394,10 @@ def _alert_params_line(a: dict) -> str:
     elif a.get("min_m2"):
         parts.append(f"📐 {a['min_m2']} m² totales o más")
     rent_cap, total_cap = _price_limits(a)
+    for k, v in sorted((a.get("max_total_por_amb") or {}).items()):
+        parts.append(f"💰 {'mono' if k == '1' else k + ' amb'}: hasta {_fmt_ars(v)}")
     if total_cap:
-        parts.append(f"💰 hasta {_fmt_ars(total_cap)} total")
+        parts.append(f"💰 {'resto: ' if a.get('max_total_por_amb') else ''}hasta {_fmt_ars(total_cap)} total")
     elif rent_cap:
         parts.append(f"💰 hasta {_fmt_ars(rent_cap)} de alquiler")
     if a.get("solo_dueno"):
